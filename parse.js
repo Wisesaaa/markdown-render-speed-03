@@ -213,18 +213,23 @@ function cleanUrl(href) {
 const SPECIAL = new Uint8Array(128);
 for (const ch of '`*_~[![<&\\\n') SPECIAL[ch.charCodeAt(0)] = 1;
 
-// Flanking helpers (CommonMark): char before/after a delimiter run.
 // Flanking helpers (CommonMark): whether a delimiter run is
 // left-flanking and/or right-flanking, from the chars around it.
 // `before`/`after` are single chars ('' at the edges of the text).
+// A run is left-flanking when the char after it is not whitespace and
+// (not punctuation, or the char before is whitespace/punctuation);
+// right-flanking is the mirror image.
 function flanking(before, after) {
-  let beforeIsSpace = before === '' || isUnicodeSpace(before);
-  let afterIsSpace = after === '' || isUnicodeSpace(after);
-  let beforeIsPunct = before !== '' && isUnicodePunct(before);
-  let afterIsPunct = after !== '' && isUnicodePunct(after);
-  let leftFlanking = !afterIsSpace && (!afterIsPunct || beforeIsSpace || beforeIsPunct);
-  let rightFlanking = !beforeIsSpace && (!beforeIsPunct || afterIsSpace || afterIsPunct);
-  return [leftFlanking, rightFlanking];
+  let bSpace = before === '' || isUnicodeSpace(before);
+  let aSpace = after === '' || isUnicodeSpace(after);
+  let bPunct = before !== '' && isUnicodePunct(before);
+  let aPunct = after !== '' && isUnicodePunct(after);
+  // left-flanking: the next char is not whitespace, and either it is
+  // not punctuation or the previous char is whitespace/punctuation
+  let left = !aSpace && (aPunct ? (bSpace || bPunct) : true);
+  // right-flanking: the mirror image
+  let right = !bSpace && (bPunct ? (aSpace || aPunct) : true);
+  return [left, right];
 }
 
 // Delimiter record: {ch, len, open, close, idx} where idx is the chunk index
