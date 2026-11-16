@@ -97,9 +97,12 @@ function isDigit(c) { return c < 128 && (CHAR_CLASS[c] & 4) !== 0; }
 function isAlphaNum(c) { return c < 128 && (CHAR_CLASS[c] & 12) !== 0; }
 // Unicode whitespace (CommonMark): space, tab, LF, FF, CR + Unicode spaces.
 const UNICODE_SPACE_SET = new Set([0xA0, 0x1680, 0x202F, 0x205F, 0x3000]);
+// Is `ch` (a single char) Unicode whitespace? ASCII whitespace (space
+// and the 9-13 controls), the 0x2000-0x200A range, or one of the set.
 function isUnicodeSpace(ch) {
   let c = ch.charCodeAt(0);
-  if (c === 32 || (c >= 9 && c <= 13)) return true;
+  if (c === 32) return true;
+  if (c >= 9 && c <= 13) return true;
   if (c >= 0x2000 && c <= 0x200A) return true;
   return UNICODE_SPACE_SET.has(c);
 }
@@ -117,15 +120,18 @@ const UNICODE_LETTER_RANGES = [
   [0x4E00, 0x9FFF], [0xAC00, 0xD7AF], [0xFF00, 0xFFEF],
 ];
 // Is code point `c` inside one of the letter ranges (binary search)?
+// The table is sorted by range start, so a binary search over it is
+// exact: narrow the window until the code point falls inside a range
+// or the window is empty.
 function isInLetterRanges(c) {
   let lo = 0;
   let hi = UNICODE_LETTER_RANGES.length - 1;
   while (lo <= hi) {
     let mid = (lo + hi) >> 1;
-    let r = UNICODE_LETTER_RANGES[mid];
-    if (c < r[0]) hi = mid - 1;
-    else if (c > r[1]) lo = mid + 1;
-    else return true;
+    let range = UNICODE_LETTER_RANGES[mid];
+    if (c < range[0]) { hi = mid - 1; continue; }
+    if (c > range[1]) { lo = mid + 1; continue; }
+    return true;
   }
   return false;
 }
@@ -133,9 +139,12 @@ function isUnicodePunct(ch) {
   if (ch.length === 0) return true;
   let c = ch.charCodeAt(0);
   if (c < 128) return isPunct(c);
-  // Letters (incl. accents, CJK, Greek, Cyrillic, Hebrew, Arabic...) are not
-  // punctuation; digits are not; everything else counts as punctuation.
-  return !isInLetterRanges(c);
+  // A non-ASCII char is punctuation when it is not a letter (incl.
+  // accents, CJK, Greek, Cyrillic, Hebrew, Arabic...) and not a digit;
+  // everything else counts as punctuation.
+  let isLetter = isInLetterRanges(c);
+  let isDigitChar = c >= 0x30 && c <= 0x39;
+  return !isLetter && !isDigitChar;
 }
 
 const ESCAPE_FOR = { 38: '&amp;', 60: '&lt;', 62: '&gt;', 34: '&quot;', 39: '&#39;' };
@@ -153,14 +162,16 @@ function escapeRun(s, out, attr) {
   if (!NEED_ESCAPE.test(s)) { out[out.length] = s; return; }
   let n = s.length;
   let start = 0;
-  for (let i = 0; i < n; i += 1) {
+  let i = 0;
+  while (i < n) {
     let c = s.charCodeAt(i);
-    if (c === 38 && attr && scanEntityRef(s, i, n) !== null) continue;
+    if (c === 38 && attr && scanEntityRef(s, i, n) !== null) { i += 1; continue; }
     let rep = ESCAPE_FOR[c];
-    if (rep === undefined) continue;
+    if (rep === undefined) { i += 1; continue; }
     if (start < i) out[out.length] = s.slice(start, i);
     out[out.length] = rep;
     start = i + 1;
+    i += 1;
   }
   if (start < n) out[out.length] = s.slice(start);
 }
