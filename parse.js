@@ -777,15 +777,28 @@ function findClosingBracket(str, start, len) {
 
 // Angle-bracket destination <...>: no newline or '<' inside, backslash
 // escapes a punctuation char. Returns {dest, next} or null.
+// Angle destination <...>: no newline or '<' inside, backslash escapes
+// punctuation. Returns {dest, next} or null. The destination is built
+// from segments (slices of plain text) joined at the end; a backslash
+// escape flushes the current segment and contributes the escaped char.
 function scanAngleDestination(s, j, n) {
   let parts = [];
+  let segStart = j + 1;
   let k = j + 1;
   while (k < n) {
     let c = s.charCodeAt(k);
-    if (c === 62) return { dest: parts.join(''), next: k + 1 }; // '>'
+    if (c === 62) { // '>'
+      if (k > segStart) parts.push(s.slice(segStart, k));
+      return { dest: parts.join(''), next: k + 1 };
+    }
     if (c === 10 || c === 60) return null; // newline or '<' not allowed
-    if (c === 92 && k + 1 < n && isPunct(s.charCodeAt(k + 1))) { parts.push(s[k + 1]); k += 2; continue; }
-    parts.push(s[k]);
+    if (c === 92 && k + 1 < n && isPunct(s.charCodeAt(k + 1))) {
+      if (k > segStart) parts.push(s.slice(segStart, k));
+      parts.push(s[k + 1]);
+      k += 2;
+      segStart = k;
+      continue;
+    }
     k += 1;
   }
   return null;
@@ -794,21 +807,28 @@ function scanAngleDestination(s, j, n) {
 // {dest, next} or null.
 function scanBareDestination(s, j, n) {
   let parts = [];
+  let segStart = j;
   let depth = 0;
   let k = j;
   while (k < n) {
     let c = s.charCodeAt(k);
     if (isSpace(c)) break;
     if (c < 32 || c === 127) return null;
-    if (c === 92 && k + 1 < n && isPunct(s.charCodeAt(k + 1))) { parts.push(s[k + 1]); k += 2; continue; }
+    if (c === 92 && k + 1 < n && isPunct(s.charCodeAt(k + 1))) {
+      if (k > segStart) parts.push(s.slice(segStart, k));
+      parts.push(s[k + 1]);
+      k += 2;
+      segStart = k;
+      continue;
+    }
     if (c === 40) depth += 1; // '('
     else if (c === 41) { // ')'
       if (depth === 0) break;
       depth -= 1;
     }
-    parts.push(s[k]);
     k += 1;
   }
+  if (k > segStart) parts.push(s.slice(segStart, k));
   return { dest: parts.join(''), next: k };
 }
 // Parse a link destination starting at s[i] (after '(' or after label).
@@ -828,13 +848,22 @@ function parseDestination(s, i, n) {
 function scanQuotedTitle(s, j, n) {
   let quote = s.charCodeAt(j);
   let parts = [];
+  let segStart = j + 1;
   let k = j + 1;
   while (k < n) {
     let c = s.charCodeAt(k);
-    if (c === quote) return { title: parts.join(''), next: k + 1 };
-    if (c === 92 && k + 1 < n && isPunct(s.charCodeAt(k + 1))) { parts.push(s[k + 1]); k += 2; continue; }
+    if (c === quote) {
+      if (k > segStart) parts.push(s.slice(segStart, k));
+      return { title: parts.join(''), next: k + 1 };
+    }
+    if (c === 92 && k + 1 < n && isPunct(s.charCodeAt(k + 1))) {
+      if (k > segStart) parts.push(s.slice(segStart, k));
+      parts.push(s[k + 1]);
+      k += 2;
+      segStart = k;
+      continue;
+    }
     if (c === 10 && k + 1 < n && s.charCodeAt(k + 1) === 10) return null; // blank line not allowed
-    parts.push(s[k]);
     k += 1;
   }
   return null;
@@ -844,20 +873,29 @@ function scanQuotedTitle(s, j, n) {
 // Returns {title, next} or null.
 function scanParenTitle(s, j, n) {
   let parts = [];
+  let segStart = j + 1;
   let depth = 0;
   let k = j + 1;
   while (k < n) {
     let c = s.charCodeAt(k);
-    if (c === 92 && k + 1 < n && isPunct(s.charCodeAt(k + 1))) { parts.push(s[k + 1]); k += 2; continue; }
+    if (c === 92 && k + 1 < n && isPunct(s.charCodeAt(k + 1))) {
+      if (k > segStart) parts.push(s.slice(segStart, k));
+      parts.push(s[k + 1]);
+      k += 2;
+      segStart = k;
+      continue;
+    }
     if (c === 41) {
-      if (depth === 0) return { title: parts.join(''), next: k + 1 };
+      if (depth === 0) {
+        if (k > segStart) parts.push(s.slice(segStart, k));
+        return { title: parts.join(''), next: k + 1 };
+      }
       depth -= 1;
     } else if (c === 40) {
       depth += 1;
     } else if (c === 10 && k + 1 < n && s.charCodeAt(k + 1) === 10) {
       return null; // a blank line inside a title is not allowed
     }
-    parts.push(s[k]);
     k += 1;
   }
   return null;
@@ -877,16 +915,18 @@ function parseTitle(s, i, n) {
 // may not contain an unescaped '['). Backslash-escaped pairs are
 // stripped first, so a '[' that survives is unescaped.
 function hasUnescapedBracket(s) {
-  return s.replace(/\\./g, '').indexOf('[') !== -1;
+  let stripped = s.replace(/\\./g, '');
+  return stripped.indexOf('[') !== -1;
 }
 // Normalize a link label: collapse ASCII whitespace runs to one space,
 // trim, case-fold (toLowerCase). Used for reference lookups.
 // Unicode case folding: toLowerCase() alone does not fold ß -> ss
 // (nor ẞ -> ss); CommonMark matches labels case-insensitively.
 function normalizeLabel(s) {
-  return s.replace(/[ \t\n\r\v\f]+/g, ' ')
-    .replace(/^[ \t\n\r\v\f]+|[ \t\n\r\v\f]+$/g, '')
-    .toLowerCase().replace(/ß/g, 'ss').replace(/ẞ/g, 'ss');
+  let collapsed = s.replace(/[ \t\n\r\v\f]+/g, ' ');
+  let trimmed = collapsed.replace(/^[ ]|[ ]$/g, '');
+  let folded = trimmed.toLowerCase();
+  return folded.replace(/ß/g, 'ss').replace(/ẞ/g, 'ss');
 }
 
 function skipSpaces(s, pos, n) {
