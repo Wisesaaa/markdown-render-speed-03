@@ -418,40 +418,68 @@ function applyEmphasisTags(html, openDelim, closeDelim, tagName, take) {
   return closeOldLeft;
 }
 
+// Is `pos` inside one of the phantom code spans? (Rule A)
+function insidePhantomSpan(phantomSpans, pos) {
+  if (!phantomSpans) return false;
+  for (let idx = 0; idx < phantomSpans.length; idx += 1) {
+    if (pos >= phantomSpans[idx][0] && pos < phantomSpans[idx][1]) return true;
+  }
+  return false;
+}
+// Is this opener/closer match suppressed (Rule A: closer inside a
+// phantom code span; Rule B: both inside the same unformed-link region
+// and the content wraps an unclean 2+ code span)? The effective
+// position of a delimiter is the position of the delimiter that THIS
+// match would consume: for a closer the leftmost remaining delimiter,
+// for an opener the rightmost remaining one.
+function emphasisMatchSuppressed(openDelim, closeDelim, text, phantomSpans, suppressedRegions) {
+  let closePos = closeDelim.pos + (closeDelim.origLen - closeDelim.len);
+  if (insidePhantomSpan(phantomSpans, closePos)) return true;
+  if (!suppressedRegions || suppressedRegions.length === 0 || text === undefined) return false;
+  let openPos = openDelim.pos + openDelim.len - 1;
+  for (let idx = 0; idx < suppressedRegions.length; idx += 1) {
+    let region = suppressedRegions[idx];
+    if (openPos >= region[0] && openPos < region[1] && closePos >= region[0] && closePos < region[1]) {
+      if (hasUncleanCodeSpan(text, openPos + 1, closePos)) return true;
+    }
+  }
+  return false;
+}
+// How many delimiters a match consumes, and which tag it makes.
+// use 2 when both runs have >= 2 (strong/del), else 1 (em);
+// '~' uses the run length (1 or 2; opener and closer lengths match).
+function emphasisTakeAndTag(openDelim, closeDelim, delimChar) {
+  let take = 1;
+  if (openDelim.len >= 2 && closeDelim.len >= 2) take = 2;
+  if (delimChar === '~') take = openDelim.len;
+  let tagName = 'em';
+  if (delimChar === '~') tagName = 'del';
+  else if (take === 2) tagName = 'strong';
+  return { take, tagName };
+}
+// Record a rule-of-3 skip for the nearest enclosing opener: if this
+// closer was both-flanking and (outer.len + closer.len) % 3 is 0 while
+// outer.len % 3 is not, marked skips it (f) and the outer match's
+// closer leftover goes inside.
+function recordInnerSkip(delimiters, openIdx, delimChar, floor, closeOldLeft) {
+  let scanIdx = openIdx - 1;
+  while (scanIdx > floor[delimChar]) {
+    let outer = delimiters[scanIdx];
+    if (outer && outer.ch === delimChar && outer.open) {
+      if (outer.len % 3 !== 0 && (outer.len + closeOldLeft) % 3 === 0) outer.hasInnerSkip = true;
+      break;
+    }
+    scanIdx -= 1;
+  }
+}
+
 function processEmphasis(delimiters, html, text, phantomSpans, suppressedRegions) {
   // Rule A: a closer whose effective position lies inside a phantom
   // code span (trigger link present) is suppressed.
   // Rule B: a match whose opener AND closer both lie inside the same
   // unformed-link region and whose content wraps an unclean 2+ code
   // span is suppressed.
-  // The effective position of a delimiter is the position of the
-  // delimiter that THIS match would consume: for a closer the leftmost
-  // remaining delimiter, for an opener the rightmost remaining one.
-  const insidePhantom = (pos) => {
-    if (!phantomSpans) return false;
-    let idx = 0;
-    while (idx < phantomSpans.length) {
-      if (pos >= phantomSpans[idx][0] && pos < phantomSpans[idx][1]) return true;
-      idx += 1;
-    }
-    return false;
-  };
-  const isSuppressed = (openDelim, closeDelim) => {
-    let closePos = closeDelim.pos + (closeDelim.origLen - closeDelim.len);
-    if (insidePhantom(closePos)) return true;
-    if (suppressedRegions && suppressedRegions.length > 0 && text !== undefined) {
-      let openPos = openDelim.pos + openDelim.len - 1;
-      let idx = 0;
-      while (idx < suppressedRegions.length) {
-        let region = suppressedRegions[idx];
-        if (openPos >= region[0] && openPos < region[1] && closePos >= region[0] && closePos < region[1]) {
-          if (hasUncleanCodeSpan(text, openPos + 1, closePos)) return true;
-        }
-        idx += 1;
-      }
-    }
-    return false;
-  };
+  const isSuppressed = (openDelim, closeDelim) => emphasisMatchSuppressed(openDelim, closeDelim, text, phantomSpans, suppressedRegions);
   // floor per delimiter char: index into delimiters (exclusive bound).
   const floor = { '*': -1, '_': -1, '~': -1 };
   // Pre-pass (marked's emStrong m-balance): for each '*'/'_' opener with
@@ -481,29 +509,10 @@ function processEmphasis(delimiters, html, text, phantomSpans, suppressedRegions
       continue;
     }
     let openDelim = delimiters[openIdx];
-    // use 2 delimiters when both runs have >= 2 (strong/del), else 1 (em).
-    // '~' uses the run length (1 or 2; opener and closer lengths match).
-    let take = 1;
-    if (openDelim.len >= 2 && closeDelim.len >= 2) take = 2;
-    if (delimChar === '~') take = openDelim.len;
-    let tagName = 'em';
-    if (delimChar === '~') tagName = 'del';
-    else if (take === 2) tagName = 'strong';
+    let { take, tagName } = emphasisTakeAndTag(openDelim, closeDelim, delimChar);
     let closeOldLeft = applyEmphasisTags(html, openDelim, closeDelim, tagName, take);
-    // Record a rule-of-3 skip for the nearest enclosing opener: if
-    // this closer was both-flanking and (outer.len + closer.len) % 3
-    // is 0 while outer.len % 3 is not, marked skips it (f) and the
-    // outer match's closer leftover goes inside.
     if (delimGroup(closeDelim.prev || '', closeDelim.next || '') === 'both') {
-      let scanIdx = openIdx - 1;
-      while (scanIdx > floor[delimChar]) {
-        let outer = delimiters[scanIdx];
-        if (outer && outer.ch === delimChar && outer.open) {
-          if (outer.len % 3 !== 0 && (outer.len + closeOldLeft) % 3 === 0) outer.hasInnerSkip = true;
-          break;
-        }
-        scanIdx -= 1;
-      }
+      recordInnerSkip(delimiters, openIdx, delimChar, floor, closeOldLeft);
     }
     // Trapping rule: delimiters strictly between the opener and closer
     // are now inside the formed emphasis and can no longer match a
