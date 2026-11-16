@@ -3622,6 +3622,37 @@ function htmlBlockLineEnds(stripped, endMarker) {
   return stripped.text.toLowerCase().includes(endMarker);
 }
 
+// The trailing newline of an HTML block (marked's ge() on the raw
+// text): the block's output ends with a newline only when the raw text
+// ends with exactly one. It ends with none when the block is terminated
+// by a blank line, when a blank line follows the closing marker
+// (types 1-5: the regex captures that blank line's newline too,
+// making two trailing newlines, which ge strips entirely), when the
+// block's lines end with blank lines, when a type 6-7 block ends at
+// another block, or when the source has no trailing newline after the
+// block's last line. Only a truly EMPTY next line strips the trailing
+// newline: marked's html regex captures the newlines after the closing
+// marker with `\n*` / `(\n+|$)`, which stops at any whitespace -- so a
+// spaces-only or tab-only line after the block does NOT add a second
+// newline and ge() keeps the one. An empty line does add one, making
+// two, which ge() strips entirely. The next line strips the trailing
+// newline when it is blank AFTER the open containers are stripped: a
+// lone '>' line in a blockquote is a blank line in the quote's text
+// (doc-30), just as an empty raw line is at the top level. A trailing
+// newline at the end of the DOCUMENT only reaches this block when it
+// is at the top level: inside a list item (or blockquote) the
+// container's text is trimmed, so the document's final newline does
+// not add one (doc-30: an HTML comment inside a tight list item must
+// not gain '\n').
+function htmlBlockTrailingNL(htmlKind, seenBlank, scanLine, sourceLines, openStack, endsWithNewline, blockNode) {
+  let nextBlank = nextLineIsBlank(sourceLines, scanLine, openStack);
+  let endsBlank = blockNode.lines.length > 0 && isBlankStr(blockNode.lines[blockNode.lines.length - 1]);
+  let endsNewline = openStack.length === 1 && endsWithNewline;
+  if (seenBlank || nextBlank || endsBlank) return false;
+  if (htmlKind <= 5) return (scanLine - 1) < sourceLines.length - 1 || endsNewline;
+  return scanLine >= sourceLines.length && endsNewline;
+}
+
 // Consume the lines of an HTML block after its opening line. Returns
 // {scanLine, seenBlank}: seenBlank is true when a blank line ended a
 // type 6-7 block.
@@ -3914,6 +3945,68 @@ function parseBlocks(sourceLines, linkDefs, endsWithNewline) {
     prevBlank = false;
   };
 
+  // Try a list item starting this line. Returns 'empty' when an empty
+  // item was consumed as-is, 'reprocess' when the item started and the
+  // line must be re-processed at the new depth (the marker span is
+  // replaced by spaces so the next pass strips the item's content
+  // indent), or null when this line is not a list item (or cannot
+  // interrupt the open paragraph). A list item can interrupt a
+  // paragraph ONLY when it is not empty and the marker is a bullet
+  // ('-', '+', '*') or an ordered marker starting at 1. EXCEPTION:
+  // inside a list item, marked lexes the content with state.top=false,
+  // so its paragraphs are single-line "text" tokens and ANY list
+  // marker (any ordered start) interrupts them. Inside a blockquote
+  // (state.top=true) or at top level the start-1 rule stands.
+  const tryListItem = (text, col, rawLine, cursorPos, colPos, lineIdx) => {
+    let indent = indentOf(text, col);
+    if (indent >= 4) return null;
+    let marker = matchListMarker(text.slice(indent), col + indent);
+    if (!marker) return null;
+    let insideItem = false;
+    if (activePara) {
+      for (let stackIdx = activeParaDepth - 1; stackIdx >= 1; stackIdx--) {
+        let nodeType = openStack[stackIdx].type;
+        if (nodeType === 'item') { insideItem = true; break; }
+        if (nodeType === 'blockquote') break;
+      }
+    }
+    let interrupts = !activePara || (!marker.empty && (!marker.ordered || marker.start === 1 || insideItem));
+    if (!interrupts) return null;
+    const parentNode = topNode();
+    markLooseAfterBlank();
+    closeParagraph();
+    // find or create the list. When the line matched an existing
+    // list in Phase 1, topNode() IS that list (already on the stack)
+    // and the new item belongs to it -- do not push it again.
+    // Otherwise the list is the parent's last child when it
+    // matches, else a new list under the parent.
+    let delimiter = marker.ordered ? text.slice(indent + marker.markerLen - 1, indent + marker.markerLen) : marker.bullet;
+    openListItem(parentNode, openStack, marker, delimiter, col);
+    // An empty item (nothing after the marker) is consumed as-is:
+    // the item stays open for later indented lines, and the line
+    // must NOT count as a blank line after the item (an indented
+    // line following it is still the item's content).
+    if (marker.empty) return 'empty';
+    // Re-process this line at the new depth: the item's content
+    // (after the marker) becomes the line's content. Replace the
+    // marker span with spaces so the next pass's container
+    // matching strips exactly the item's content indent: the
+    // remainder starts at column marker.contentIndent, and the
+    // replacement puts it at column column + S where S =
+    // marker.contentIndent - column (column = column of the content's
+    // first char in the raw line; S >= 1 for a non-empty item
+    // because the content's indent covers the padding spaces).
+    // When the container prefix ends with a blockquote '>'
+    // that consumed no following space in this pass (e.g.
+    // '>+ At'), the re-processed line's blockquote WILL eat
+    // one of the replacement spaces as its optional space, so
+    // add one extra to keep the item indent aligned.
+    let restText = sliceCols(text, col, marker.contentIndent - col) ?? '';
+    let quoteEatsSpace = cursorPos > 0 && rawLine.charCodeAt(cursorPos - 1) === 62 ? 1 : 0;
+    sourceLines[lineIdx] = rawLine.slice(0, cursorPos) + ' '.repeat(marker.contentIndent - colPos + quoteEatsSpace) + restText;
+    return 'reprocess';
+  };
+
   for (let lineNo = 0; lineNo < sourceLines.length; lineNo++) {
     const raw = sourceLines[lineNo];
     const prevWasLazy = prevLazy;
@@ -4075,38 +4168,9 @@ function parseBlocks(sourceLines, linkDefs, endsWithNewline) {
           scanLine = consumed.scanLine;
           seenBlank = consumed.seenBlank;
         }
-        // trailing newline (marked's ge() on the raw text): the block's
-        // output ends with a newline only when the raw text ends with
-        // exactly one. It ends with none when the block is terminated by
-        // a blank line, when a blank line follows the closing marker
-        // (types 1-5: the regex captures that blank line's newline too,
-        // making two trailing newlines, which ge strips entirely), when
-        // the block's lines end with blank lines, when a type 6-7 block
-        // ends at another block, or when the source has no trailing
-        // newline after the block's last line.
-        // Only a truly EMPTY next line strips the trailing newline:
-        // marked's html regex captures the newlines after the closing
-        // marker with `\n*` / `(\n+|$)`, which stops at any whitespace
-        // -- so a spaces-only or tab-only line after the block does
-        // NOT add a second newline and ge() keeps the one. An empty
-        // line does add one, making two, which ge() strips entirely.
-        // The next line strips the trailing newline when it is blank
-        // AFTER the open containers are stripped: a lone '>' line in
-        // a blockquote is a blank line in the quote's text (doc-30),
-        // just as an empty raw line is at the top level.
-        let nextBlank = nextLineIsBlank(sourceLines, scanLine, openStack);
-        const endsBlank = blockNode.lines.length > 0 && isBlankStr(blockNode.lines[blockNode.lines.length - 1]);
-        // A trailing newline at the end of the DOCUMENT only reaches
-        // this block when it is at the top level: inside a list item
-        // (or blockquote) the container's text is trimmed, so the
-        // document's final newline does not add one (doc-30: an HTML
-        // comment inside a tight list item must not gain '\n').
-        const endsNewline = openStack.length === 1 && endsWithNewline;
-        let trailingNewline;
-        if (seenBlank || nextBlank || endsBlank) trailingNewline = false;
-        else if (htmlKind <= 5) trailingNewline = (scanLine - 1) < sourceLines.length - 1 || endsNewline;
-        else trailingNewline = scanLine >= sourceLines.length && endsNewline;
-        blockNode.trailingNL = trailingNewline;
+        // trailing newline (marked's ge() on the raw text) -- see
+        // htmlBlockTrailingNL for the full rule.
+        blockNode.trailingNL = htmlBlockTrailingNL(htmlKind, seenBlank, scanLine, sourceLines, openStack, endsWithNewline, blockNode);
         lineNo = scanLine - 1;
         prevBlank = seenBlank;
         if (seenBlank) prevBlankTop = topNode().type;
@@ -4135,68 +4199,15 @@ function parseBlocks(sourceLines, linkDefs, endsWithNewline) {
 
     // ---- list item ----
     {
-      const indent = indentOf(lineText, textCol);
-      if (indent < 4) {
-        const marker = matchListMarker(lineText.slice(indent), textCol + indent);
-        if (marker) {
-          // a list item can interrupt a paragraph ONLY when it is not
-          // empty and the marker is '-', '+', '*' (bullet) or an ordered
-          // marker starting at 1 (an empty item never interrupts).
-          // EXCEPTION: inside a list item, marked lexes the content
-          // with state.top=false, so its paragraphs are single-line
-          // "text" tokens and ANY list marker (any ordered start)
-          // interrupts them. Inside a blockquote (state.top=true) or
-          // at top level the start-1 rule stands.
-          let insideItem = false;
-          if (activePara) {
-            for (let stackIdx = activeParaDepth - 1; stackIdx >= 1; stackIdx--) {
-              const nodeType = openStack[stackIdx].type;
-              if (nodeType === 'item') { insideItem = true; break; }
-              if (nodeType === 'blockquote') break;
-            }
-          }
-          const mayInterrupt = !activePara || (!marker.empty && (!marker.ordered || marker.start === 1 || insideItem));
-          if (mayInterrupt) {
-            const parentNode = topNode();
-            markLooseAfterBlank();
-            closeParagraph();
-            // find or create the list. When the line matched an existing
-            // list in Phase 1, topNode() IS that list (already on the stack)
-            // and the new item belongs to it -- do not push it again.
-            // Otherwise the list is the parent's last child when it
-            // matches, else a new list under the parent.
-            const delimiter = marker.ordered ? lineText.slice(indent + marker.markerLen - 1, indent + marker.markerLen) : marker.bullet;
-            openListItem(parentNode, openStack, marker, delimiter, textCol);
-            // An empty item (nothing after the marker) is consumed as-is:
-            // the item stays open for later indented lines, and the line
-            // must NOT count as a blank line after the item (an indented
-            // line following it is still the item's content).
-            if (marker.empty) {
-              prevBlank = false;
-              continue;
-            }
-            // Re-process this line at the new depth: the item's content
-            // (after the marker) becomes the line's content. Replace the
-            // marker span with spaces so the next pass's container
-            // matching strips exactly the item's content indent: the
-            // remainder starts at column marker.contentIndent, and the
-            // replacement puts it at column column + S where S =
-            // marker.contentIndent - column (column = column of the content's
-            // first char in the raw line; S >= 1 for a non-empty item
-            // because the content's indent covers the padding spaces).
-            // When the container prefix ends with a blockquote '>'
-            // that consumed no following space in this pass (e.g.
-            // '>+ At'), the re-processed line's blockquote WILL eat
-            // one of the replacement spaces as its optional space, so
-            // add one extra to keep the item indent aligned.
-            const restText = sliceCols(lineText, textCol, marker.contentIndent - textCol) ?? '';
-            const quoteEatsSpace = cursor > 0 && raw.charCodeAt(cursor - 1) === 62 ? 1 : 0;
-            sourceLines[lineNo] = raw.slice(0, cursor) + ' '.repeat(marker.contentIndent - column + quoteEatsSpace) + restText;
-            lineNo--;
-            prevBlank = false;
-            continue;
-          }
-        }
+      let listResult = tryListItem(lineText, textCol, raw, cursor, column, lineNo);
+      if (listResult === 'empty') {
+        prevBlank = false;
+        continue;
+      }
+      if (listResult === 'reprocess') {
+        lineNo--;
+        prevBlank = false;
+        continue;
       }
     }
 
