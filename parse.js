@@ -22,47 +22,57 @@ const ENTITY_DIGIT = new Int8Array(128).fill(-1);
 for (let d = 0; d <= 9; d++) ENTITY_DIGIT[48 + d] = d;
 for (let d = 0; d < 6; d++) { ENTITY_DIGIT[97 + d] = 10 + d; ENTITY_DIGIT[65 + d] = 10 + d; }
 // Scan a numeric character reference (&#123; or &#x7B;) at s[i] ('&').
-// Returns {named: false, value, next} or null.
+// Returns {named: false, value, next} or null. The digits are read
+// left to right into the value; at most 7 decimal or 6 hex digits are
+// taken, and the reference must end with ';'. A value of 0, above
+// 0x10FFFF, or in the surrogate range decodes to U+FFFD.
 function scanNumericEntityRef(s, i, n) {
   let j = i + 2;
-  let hex = j < n && (s.charCodeAt(j) === 120 || s.charCodeAt(j) === 88);
-  if (hex) j += 1;
-  let base = hex ? 16 : 10;
-  let maxD = hex ? 6 : 7;
-  let v = 0;
-  let d = 0;
-  while (j < n && d < maxD) {
+  let isHex = j < n && (s.charCodeAt(j) === 120 || s.charCodeAt(j) === 88);
+  if (isHex) j += 1;
+  let base = isHex ? 16 : 10;
+  let maxDigits = isHex ? 6 : 7;
+  let value = 0;
+  let digits = 0;
+  while (j < n && digits < maxDigits) {
     let c = s.charCodeAt(j);
     if (c >= 128) break;
-    let dv = ENTITY_DIGIT[c];
-    if (dv < 0 || (!hex && dv > 9)) break;
-    v = v * base + dv;
-    d += 1;
+    let digitVal = ENTITY_DIGIT[c];
+    if (digitVal < 0) break;
+    if (!isHex && digitVal > 9) break;
+    value = value * base + digitVal;
+    digits += 1;
     j += 1;
   }
-  if (d === 0 || j >= n || s.charCodeAt(j) !== 59) return null;
-  if (v === 0 || v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) return { named: false, value: '\uFFFD', next: j + 1 };
-  return { named: false, value: String.fromCodePoint(v), next: j + 1 };
+  if (digits === 0) return null;
+  if (j >= n || s.charCodeAt(j) !== 59) return null;
+  let isBad = value === 0 || value > 0x10FFFF || (value >= 0xD800 && value <= 0xDFFF);
+  if (isBad) return { named: false, value: '\uFFFD', next: j + 1 };
+  return { named: false, value: String.fromCodePoint(value), next: j + 1 };
 }
 // Scan a named entity reference (&name;) at s[i] ('&'). Returns
-// {named: true, value, next} or null.
+// {named: true, value, next} or null. The name starts with a letter
+// and continues with letters, digits, or '_', ending with ';'.
 function scanNamedEntityRef(s, i, n) {
-  let c1 = s.charCodeAt(i + 1);
-  if (!((c1 >= 65 && c1 <= 90) || (c1 >= 97 && c1 <= 122))) return null;
+  let first = s.charCodeAt(i + 1);
+  let firstIsLetter = (first >= 65 && first <= 90) || (first >= 97 && first <= 122);
+  if (!firstIsLetter) return null;
   let j = i + 1;
   while (j < n) {
     let c = s.charCodeAt(j);
-    let ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95;
-    if (!ok) break;
+    let isLetter = (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+    let isDigit = c >= 48 && c <= 57;
+    if (!isLetter && !isDigit && c !== 95) break;
     j += 1;
   }
   if (j >= n || s.charCodeAt(j) !== 59) return null;
   return { named: true, value: s.slice(i, j + 1), next: j + 1 };
 }
+// Dispatch an '&' reference: '#' starts a numeric reference, anything
+// else a named one. Returns the reference object or null.
 function scanEntityRef(s, i, n) {
   if (i + 1 >= n) return null;
-  let c1 = s.charCodeAt(i + 1);
-  if (c1 === 35) return scanNumericEntityRef(s, i, n);
+  if (s.charCodeAt(i + 1) === 35) return scanNumericEntityRef(s, i, n);
   return scanNamedEntityRef(s, i, n);
 }
 
@@ -2823,31 +2833,37 @@ function skipWsNewlines(doc, scan, len) {
 }
 
 // Optional title after a ref def's destination. Returns {title, end} or null.
-function refDefTitle(doc, endPos, len) {
-  let skipped = skipWsNewlines(doc, endPos, len);
-  let titleScan = skipped.pos;
-  if (titleScan <= endPos) return null;
-  if (titleScan >= len) return null;
+// Parse the optional title after a reference definition's
+// destination. The title must follow whitespace (spaces, tabs, or a
+// newline) and must be on the same line or the next one (at most one
+// newline may intervene). Returns {title, end} or null.
+function refDefTitle(doc, afterDest, len) {
+  let skipped = skipWsNewlines(doc, afterDest, len);
+  let titleAt = skipped.pos;
+  if (titleAt <= afterDest) return null;
+  if (titleAt >= len) return null;
   if (skipped.nlCount > 1) return null;
-  // a title must be preceded by whitespace (space/tab/newline)
-  let q = doc.charCodeAt(titleScan);
-  if (q !== 34 && q !== 39 && q !== 40) return null;
-  let titleInfo = parseTitle(doc, titleScan, len);
+  let quote = doc.charCodeAt(titleAt);
+  let isQuote = quote === 34 || quote === 39 || quote === 40;
+  if (!isQuote) return null;
+  let titleInfo = parseTitle(doc, titleAt, len);
   if (!titleInfo) return null;
   return { title: titleInfo.title, end: titleInfo.next };
 }
-// After the def, only whitespace then EOL/EOF. Returns the end position
-// (just past the newline) or -1 when there is trailing junk.
-function refDefTailEnd(doc, endPos, len) {
-  let m = /^[ \t]*/.exec(doc.slice(endPos, len));
-  let tail = endPos + (m ? m[0].length : 0);
+// After a definition, only whitespace then EOL/EOF may follow.
+// Returns the end position (just past the newline) or -1 when there
+// is trailing junk on the line.
+function refDefTailEnd(doc, afterDef, len) {
+  let tail = afterDef;
+  while (tail < len && (doc.charCodeAt(tail) === 32 || doc.charCodeAt(tail) === 9)) tail += 1;
   if (tail < len && doc.charCodeAt(tail) !== 10) return -1;
   if (tail < len) tail += 1;
   return tail;
 }
 
 // Parse one link reference definition starting at doc[start] (the '[').
-// Returns {label, dest, title, end} or null. The label is normalised.
+// Returns {label, dest, title, end} or null. The label is normalised
+// (case-folded, whitespace-collapsed) before it is stored.
 function parseRefDef(doc, start, len) {
   // label: [ ... ] (may span lines; brackets nest, backslash escapes)
   let closeBracket = findClosingBracket(doc, start, len);
@@ -2859,9 +2875,9 @@ function parseRefDef(doc, start, len) {
   let normLabel = normalizeLabel(labelText);
   if (normLabel.length === 0) return null;
   let cursor = closeBracket + 1;
-  // ':' then whitespace (incl. newlines, but at most one blank line is
-  // not allowed -- a blank line ends the def)
-  if (cursor >= len || doc.charCodeAt(cursor) !== 58) return null;
+  // ':' then whitespace (incl. newlines, but a blank line ends the def)
+  if (cursor >= len) return null;
+  if (doc.charCodeAt(cursor) !== 58) return null;
   cursor += 1;
   let skipped = skipWsNewlines(doc, cursor, len);
   if (skipped.nlCount > 1) return null;
@@ -2879,12 +2895,19 @@ function parseRefDef(doc, start, len) {
   if (tailEnd !== -1) return { label: normLabel, dest: target, title: titleText, end: tailEnd };
   // a malformed title does not kill the def: retry without it
   // (the title line stays as paragraph text)
-  if (titleText !== null) {
-    let retryEnd = refDefTailEnd(doc, destInfo.next, len);
-    if (retryEnd === -1) return null;
-    return { label: normLabel, dest: target, title: null, end: retryEnd };
-  }
-  return null;
+  if (titleText === null) return null;
+  let retryEnd = refDefTailEnd(doc, destInfo.next, len);
+  if (retryEnd === -1) return null;
+  return { label: normLabel, dest: target, title: null, end: retryEnd };
+}
+
+// The leading spaces before a reference definition (at most 3 are
+// allowed). Returns the count, or -1 when the indent is too deep.
+function refDefIndent(doc, pos, len) {
+  let indent = 0;
+  while (pos + indent < len && doc.charCodeAt(pos + indent) === 32) indent += 1;
+  if (indent > 3) return -1;
+  return indent;
 }
 
 // Extract leading link reference definitions from a paragraph's joined
@@ -2893,11 +2916,9 @@ function parseRefDef(doc, start, len) {
 function extractRefDefs(doc, linkDefs) {
   let pos = 0;
   let len = doc.length;
-  // skip up to 3 spaces of indent before a def
   while (pos < len) {
-    let m = /^ */.exec(doc.slice(pos));
-    let indent = m ? m[0].length : 0;
-    if (indent > 3) break;
+    let indent = refDefIndent(doc, pos, len);
+    if (indent === -1) break;
     let scan = pos + indent;
     if (scan >= len || doc.charCodeAt(scan) !== 91) break; // '['
     let refDef = parseRefDef(doc, scan, len);
@@ -3082,7 +3103,6 @@ function nearestListInStack(openStack) {
 // blank line joined into it yields the trailing newline). If the list
 // ends at the blank line (or there is no list), the newline is stripped.
 function listContinuesAfterBlank(sourceLines, lineNo, openStack) {
-  // nearest list in the stack
   let found = nearestListInStack(openStack);
   if (!found) return false;
   let listPos = found.pos;
@@ -3099,17 +3119,22 @@ function listContinuesAfterBlank(sourceLines, lineNo, openStack) {
   let listMarker = matchListMarker(strippedLine.text.slice(indent), strippedLine.col + indent);
   if (!listMarker) return false;
   if (listMarker.ordered !== listNode.ordered) return false;
+  let markerDelim;
   if (listMarker.ordered) {
-    let delimiter = strippedLine.text.slice(indent + listMarker.markerLen - 1, indent + listMarker.markerLen);
-    if (delimiter !== listNode.delimiter) return false;
-  } else if (listMarker.bullet !== listNode.delimiter) return false;
-  return true;
+    markerDelim = strippedLine.text.slice(indent + listMarker.markerLen - 1, indent + listMarker.markerLen);
+  } else {
+    markerDelim = listMarker.bullet;
+  }
+  return markerDelim === listNode.delimiter;
 }
 
 // Replace oldNode with newNode in parentNode's children (or remove it
 // when newNode is null). Returns true when oldNode was found.
 function replaceChild(parentNode, oldNode, newNode) {
-  let childIdx = parentNode.children.findIndex((child) => child === oldNode);
+  let childIdx = -1;
+  for (let idx = 0; idx < parentNode.children.length; idx += 1) {
+    if (parentNode.children[idx] === oldNode) { childIdx = idx; break; }
+  }
   if (childIdx === -1) return false;
   if (newNode === null) parentNode.children.splice(childIdx, 1);
   else parentNode.children[childIdx] = newNode;
@@ -3142,8 +3167,13 @@ function finalizeParagraph(para, parentNode, linkDefs) {
 // Does a line start with a blockquote marker '>' (after spaces/tabs)?
 function startsWithBlockquoteMarker(lineText) {
   let scanPos = 0;
-  while (scanPos < lineText.length && (lineText.charCodeAt(scanPos) === 32 || lineText.charCodeAt(scanPos) === 9)) scanPos += 1;
-  return scanPos < lineText.length && lineText.charCodeAt(scanPos) === 62;
+  while (scanPos < lineText.length) {
+    let code = lineText.charCodeAt(scanPos);
+    if (code !== 32 && code !== 9) break;
+    scanPos += 1;
+  }
+  if (scanPos >= lineText.length) return false;
+  return lineText.charCodeAt(scanPos) === 62;
 }
 
 // Block matchers that can interrupt a paragraph, in order. Each takes
@@ -3157,13 +3187,15 @@ const PARA_INTERRUPTERS = [
 ];
 // Does this line start a block that can interrupt a paragraph?
 // (Used to decide whether a non-matching line is a lazy continuation.)
+// A blockquote marker or a list marker at indent < 4 interrupts, as
+// do the ATX / fence / HR / setext matchers and HTML blocks of types
+// 1-6.
 function canInterruptPara(lineText, textCol) {
   let indent = indentOf(lineText, textCol);
   if (indent < 4) {
-    // blockquote
     if (startsWithBlockquoteMarker(lineText)) return true;
-    // list item
-    if (matchListMarker(lineText.slice(indent), textCol + indent)) return true;
+    let markerText = lineText.slice(indent);
+    if (matchListMarker(markerText, textCol + indent)) return true;
   }
   for (let check of PARA_INTERRUPTERS) {
     if (check(lineText, textCol)) return true;
