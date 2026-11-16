@@ -515,6 +515,34 @@ function recordInnerSkip(delimiters, openIdx, delimChar, floor, closeOldLeft) {
   }
 }
 
+// Remove exhausted delimiters from the stack after a match: an
+// opener whose length reached 0, and a closer whose length reached 0
+// (or a leftover single '~', which can never form a strikethrough).
+// Returns {closeIdx, removed}: the adjusted closer index (a splice
+// before it shifts it down) and whether anything was removed (which
+// invalidates the floor bounds). A closer that still has delimiters
+// stays as the current closer so it can match another opener.
+function removeExhaustedDelimiters(delimiters, openDelim, closeDelim, delimChar, closeIdx) {
+  let removed = false;
+  let newCloseIdx = closeIdx;
+  let openExhausted = openDelim.len === 0 || (delimChar === '~' && openDelim.len < 2);
+  if (openExhausted) {
+    let openSlot = delimiters.indexOf(openDelim);
+    if (openSlot !== -1) delimiters.splice(openSlot, 1);
+    if (openSlot < newCloseIdx) newCloseIdx -= 1;
+    if (openSlot !== -1) removed = true;
+  }
+  if (closeDelim.len === 0) {
+    delimiters.splice(newCloseIdx, 1);
+    removed = true;
+    // do not advance closeIdx: the next delimiter slid into this slot
+  } else if (delimChar === '~' && closeDelim.len < 2) {
+    // a leftover single '~' can never form a strikethrough; skip it
+    newCloseIdx += 1;
+  }
+  return { closeIdx: newCloseIdx, removed };
+}
+
 function processEmphasis(delimiters, html, text, phantomSpans, suppressedRegions) {
   // Rule A: a closer whose effective position lies inside a phantom
   // code span (trigger link present) is suppressed.
@@ -571,28 +599,9 @@ function processEmphasis(delimiters, html, text, phantomSpans, suppressedRegions
       resetEmphasisFloors(floor);
     }
     // remove exhausted delimiters from the stack
-    let removed = false;
-    if (openDelim.len === 0) {
-      let openSlot = delimiters.indexOf(openDelim);
-      if (openSlot !== -1) delimiters.splice(openSlot, 1);
-      if (openSlot < closeIdx) closeIdx -= 1;
-      if (openSlot !== -1) removed = true;
-    } else if (delimChar === '~' && openDelim.len < 2) {
-      // a leftover single '~' can never form a strikethrough; drop it
-      let openSlot = delimiters.indexOf(openDelim);
-      if (openSlot !== -1) delimiters.splice(openSlot, 1);
-      if (openSlot < closeIdx) closeIdx -= 1;
-      if (openSlot !== -1) removed = true;
-    }
-    if (closeDelim.len === 0) {
-      delimiters.splice(closeIdx, 1);
-      removed = true;
-      // do not advance closeIdx: the next delimiter slid into this slot
-    } else if (delimChar === '~' && closeDelim.len < 2) {
-      // a leftover single '~' can never form a strikethrough; skip it
-      closeIdx += 1;
-    }
-    if (removed) resetEmphasisFloors(floor);
+    let cleanup = removeExhaustedDelimiters(delimiters, openDelim, closeDelim, delimChar, closeIdx);
+    closeIdx = cleanup.closeIdx;
+    if (cleanup.removed) resetEmphasisFloors(floor);
     // if the closer still has delimiters, keep it as current (closeIdx unchanged)
     // so it can match another opener.
   }
@@ -4007,6 +4016,47 @@ function parseBlocks(sourceLines, linkDefs, endsWithNewline) {
     return 'reprocess';
   };
 
+  // Try a lazy continuation: the line belongs to the open paragraph
+  // even though it does not match the paragraph's containers. Returns
+  // true when the line was appended as a lazy continuation. Only when
+  // the line does NOT start a block that interrupts a paragraph. The
+  // containers stay open (do NOT pop them) so a later line that does
+  // match them continues the same block. A setext underline that is
+  // ONLY a setext underline (an '=' line, or a '-' line that is neither
+  // a thematic break nor a list marker) cannot be a lazy heading
+  // underline: it stays paragraph text. Inside a blockquote, when the
+  // previous line was also lazy, it is indented 4 spaces (marked's
+  // blockquoteSetextReplace) so it is not mistaken for a heading when
+  // the paragraph is parsed; otherwise it is kept as-is. In a list item
+  // it is always kept as-is. A lazy line indented 4+ columns loses
+  // exactly 4 of them (indented-code indent); fewer are kept as-is.
+  const tryLazyContinuation = (text, col, matchedDepth, blank, wasLazy) => {
+    if (matchedDepth >= openStack.length || !activePara || blank) return false;
+    const setextLazy = matchSetext(text, col);
+    const pureSetext = setextLazy === 1 ||
+      (setextLazy === 2 && !matchHR(text, col) && !matchListMarker(text.slice(indentOf(text, col)), col + indentOf(text, col)));
+    if (pureSetext) {
+      const firstOpen = openStack[matchedDepth];
+      if (firstOpen && firstOpen.type === 'blockquote' && wasLazy) {
+        activePara.lines.push('    ' + text.replace(/^[ \t]+/, ''));
+      } else {
+        activePara.lines.push(text);
+      }
+      prevBlank = false;
+      prevLazy = true;
+      return true;
+    }
+    if (canInterruptPara(text, col)) return false;
+    let lazyText = text;
+    if (indentOf(text, col) >= 4) {
+      lazyText = stripIndent(text, col, 4);
+    }
+    activePara.lines.push(lazyText);
+    prevBlank = false;
+    prevLazy = true;
+    return true;
+  };
+
   for (let lineNo = 0; lineNo < sourceLines.length; lineNo++) {
     const raw = sourceLines[lineNo];
     const prevWasLazy = prevLazy;
@@ -4036,46 +4086,7 @@ function parseBlocks(sourceLines, linkDefs, endsWithNewline) {
 
     // ---------- lazy continuation ----------
     // (only when the line does NOT start a block that interrupts a paragraph)
-    if (matchedDepth < openStack.length && activePara && !blankText) {
-      // A setext underline that is ONLY a setext underline (an '='
-      // line, or a '-' line that is neither a thematic break nor a
-      // list marker) cannot be a lazy heading underline: it stays
-      // paragraph text. Inside a blockquote, when the previous line was
-      // also lazy, it is indented 4 spaces (marked's
-      // blockquoteSetextReplace) so it is not mistaken for a heading
-      // when the paragraph is parsed; otherwise it is kept as-is. In a
-      // list item it is always kept as-is.
-      const setextLazy = matchSetext(lineText, textCol);
-      const pureSetext = setextLazy === 1 ||
-        (setextLazy === 2 && !matchHR(lineText, textCol) && !matchListMarker(lineText.slice(indentOf(lineText, textCol)), textCol + indentOf(lineText, textCol)));
-      if (pureSetext) {
-        const firstOpen = openStack[matchedDepth];
-        if (firstOpen && firstOpen.type === 'blockquote' && prevWasLazy) {
-          activePara.lines.push('    ' + lineText.replace(/^[ \t]+/, ''));
-        } else {
-          activePara.lines.push(lineText);
-        }
-        prevBlank = false;
-        prevLazy = true;
-        continue;
-      }
-      if (!canInterruptPara(lineText, textCol)) {
-        // lazy continuation: the line belongs to the open paragraph even
-        // though it does not match the paragraph's containers. The
-        // containers stay open (do NOT pop them) so a later line that does
-        // match them continues the same block; append this line to it.
-        // A lazy line indented 4+ columns loses exactly 4 of them
-        // (indented-code indent); fewer are kept as-is.
-        let lazyText = lineText;
-        if (indentOf(lineText, textCol) >= 4) {
-          lazyText = stripIndent(lineText, textCol, 4);
-        }
-        activePara.lines.push(lazyText);
-        prevBlank = false;
-        prevLazy = true;
-        continue;
-      }
-    }
+    if (tryLazyContinuation(lineText, textCol, matchedDepth, blankText, prevWasLazy)) continue;
     if (matchedDepth < openStack.length) {
       closeToDepth(matchedDepth);
     }
