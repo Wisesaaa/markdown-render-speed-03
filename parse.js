@@ -1531,7 +1531,9 @@ function tryRawHtml(str, start, len) {
 // ---------------------------------------------------------------------------
 
 function isEmailChar(c, withAt) {
-  if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57)) return true;
+  let isLetter = (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+  let isDigit = c >= 48 && c <= 57;
+  if (isLetter || isDigit) return true;
   if (c === 46 || c === 45 || c === 95 || c === 43) return true;
   if (withAt && c === 64) return true;
   return false;
@@ -1541,10 +1543,7 @@ function isEmailChar(c, withAt) {
 // local-part chars to an '@', then validate the whole email.
 function underscoreInEmail(s, i, n) {
   let j = i;
-  while (j < n) {
-    if (!isEmailChar(s.charCodeAt(j), false)) break;
-    j += 1;
-  }
+  while (j < n && isEmailChar(s.charCodeAt(j), false)) j += 1;
   if (j >= n || s.charCodeAt(j) !== 64) return false;
   let em = matchEmailAt(s, j, n, 0);
   if (em === null) return false;
@@ -1556,10 +1555,7 @@ function underscoreInEmail(s, i, n) {
 // the whole email.
 function underscoreInEmailDomain(s, i, n) {
   let j = i;
-  while (j > 0) {
-    if (!isEmailChar(s.charCodeAt(j - 1), true)) break;
-    j -= 1;
-  }
+  while (j > 0 && isEmailChar(s.charCodeAt(j - 1), true)) j -= 1;
   let at = s.indexOf('@', j);
   if (at === -1 || at >= i) return false;
   let em = matchEmailAt(s, at, n, 0);
@@ -1573,14 +1569,16 @@ const URL_SCHEMES = ['https', 'http', 'ftp'];
 // searching only before index `limit`. Returns the start index or -1,
 // and advances `state.pos` past a rejected candidate.
 function findUrlStart(s, from, limit, state) {
-  let w = s.indexOf('www.', from);
-  let c = s.indexOf('://', from);
-  if (w !== -1 && w < limit && (c === -1 || w <= c)) return w;
-  if (c === -1 || c >= limit) return -1;
+  let wwwAt = s.indexOf('www.', from);
+  let schemeAt = s.indexOf('://', from);
+  let wwwInRange = wwwAt !== -1 && wwwAt < limit;
+  let schemeInRange = schemeAt !== -1 && schemeAt < limit;
+  if (wwwInRange && (!schemeInRange || wwwAt <= schemeAt)) return wwwAt;
+  if (!schemeInRange) return -1;
   for (let scheme of URL_SCHEMES) {
-    if (s.slice(c - scheme.length, c).toLowerCase() === scheme) return c - scheme.length;
+    if (s.slice(schemeAt - scheme.length, schemeAt).toLowerCase() === scheme) return schemeAt - scheme.length;
   }
-  state.pos = c + 3;
+  state.pos = schemeAt + 3;
   return -2;
 }
 
@@ -1588,8 +1586,10 @@ function findUrlStart(s, from, limit, state) {
 // preceded by a non-space char that is not a delimiter or '(' is part
 // of a larger token, not a URL start.)
 function wwwPrevOk(s, us) {
-  let prev = us > 0 ? s[us - 1] : '';
-  return prev === '' || isUnicodeSpace(prev) || prev === '*' || prev === '_' || prev === '~' || prev === '(';
+  if (us === 0) return true;
+  let prev = s[us - 1];
+  if (isUnicodeSpace(prev)) return true;
+  return prev === '*' || prev === '_' || prev === '~' || prev === '(';
 }
 
 // A URL that is a link destination [text](url) ends at the paren
@@ -1599,7 +1599,8 @@ function wwwPrevOk(s, us) {
 // keep the whole run (e.g. [i](https://e.com)*](https://x.org)).
 // Returns the index of the matching ')' or -1.
 function linkDestCloseParen(s, us, n) {
-  if (us < 2 || s.charCodeAt(us - 1) !== 40 || s.charCodeAt(us - 2) !== 93) return -1;
+  if (us < 2) return -1;
+  if (s.charCodeAt(us - 1) !== 40 || s.charCodeAt(us - 2) !== 93) return -1;
   let depth = 0;
   let k = us - 1;
   while (k < n) {
@@ -1621,8 +1622,9 @@ function delimInUrl(s, i, n) {
   // fast path: at a token boundary (preceded by space/'<'/start) a
   // delimiter cannot sit inside a URL
   if (i === 0) return false;
-  let pc = s.charCodeAt(i - 1);
-  if (pc === 32 || pc === 9 || pc === 10 || pc === 13 || pc === 60) return false;
+  let prevCode = s.charCodeAt(i - 1);
+  let atBoundary = prevCode === 32 || prevCode === 9 || prevCode === 10 || prevCode === 13 || prevCode === 60;
+  if (atBoundary) return false;
   let t = i;
   while (t > 0) {
     let c = s.charCodeAt(t - 1);
@@ -1640,15 +1642,12 @@ function delimInUrl(s, i, n) {
       continue;
     }
     let end0 = matchUrlAt(s, us, n);
-    if (end0 !== -1) {
-      let end = end0;
-      let closeAt = linkDestCloseParen(s, us, n);
-      if (closeAt !== -1 && closeAt < end) end = closeAt;
-      if (i < end) return true;
-      p = end; // skip past this URL; a www. inside it is not a new start
-      continue;
-    }
-    p = us + 1;
+    if (end0 === -1) { p = us + 1; continue; }
+    let end = end0;
+    let closeAt = linkDestCloseParen(s, us, n);
+    if (closeAt !== -1 && closeAt < end) end = closeAt;
+    if (i < end) return true;
+    p = end; // skip past this URL; a www. inside it is not a new start
   }
   return false;
 }
@@ -1683,8 +1682,10 @@ const URL_SCHEME_NAMES = ['https', 'http', 'ftp'];
 // Returns the scheme start index, or -1 when the text before it is
 // not a known scheme.
 function schemeStartAt(src, c) {
-  for (let s = 0; s < URL_SCHEME_NAMES.length; s++) {
-    let name = URL_SCHEME_NAMES[s];
+  let sIdx = 0;
+  while (sIdx < URL_SCHEME_NAMES.length) {
+    let name = URL_SCHEME_NAMES[sIdx];
+    sIdx += 1;
     if (src.slice(c - name.length, c).toLowerCase() === name) return c - name.length;
   }
   return -1;
@@ -1720,9 +1721,8 @@ function emailAddressSpan(text, start, end, to) {
     prefix = 'xmpp:';
     // one /path segment of [A-Za-z0-9@.]+
     if (end < to && text.charCodeAt(end) === 47) {
-      let pathEnd = end + 1;
-      while (pathEnd < to && /[A-Za-z0-9@.]/.test(text[pathEnd])) pathEnd += 1;
-      if (pathEnd > end + 1) end = pathEnd;
+      let pathEnd = extendXmppPath(text, end, to);
+      end = pathEnd;
     }
   }
   return { start: spanStart, prefix, end };
