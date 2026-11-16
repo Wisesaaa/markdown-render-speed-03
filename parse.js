@@ -1218,15 +1218,23 @@ function matchUrlAt(s, i, n) {
 // single-pass scan sees it, so we replicate the effect here: a trailing
 // '_' after an email is a closer (not part of the address) exactly when
 // a matching opener exists before the email.
+// Is there a '_' before index `upto` in `s` that can open an emphasis?
+// A '_' opens when it is left-flanking and (not right-flanking, or the
+// char before it is punctuation) -- the same canOpen rule parseInline
+// uses for '_'. Marked resolves emphasis before matching emails, so a
+// '_' closer after an email is invisible to its email regex; our
+// single-pass scan sees it, so we replicate the effect here: a trailing
+// '_' after an email is a closer (not part of the address) exactly when
+// a matching opener exists before the email.
 function hasUnderscoreOpener(s, upto) {
   let i = 0;
   while (i < upto) {
-    if (s.charCodeAt(i) === 95) {
-      let before = i > 0 ? s[i - 1] : '';
-      let after = i + 1 < s.length ? s[i + 1] : '';
-      let flank = flanking(before, after);
-      if (flank[0] && (!flank[1] || isUnicodePunct(before))) return true;
-    }
+    if (s.charCodeAt(i) !== 95) { i += 1; continue; }
+    let before = i > 0 ? s[i - 1] : '';
+    let after = i + 1 < s.length ? s[i + 1] : '';
+    let flank = flanking(before, after);
+    let canOpen = flank[0] && (!flank[1] || isUnicodePunct(before));
+    if (canOpen) return true;
     i += 1;
   }
   return false;
@@ -1238,7 +1246,8 @@ function emailLocalStart(s, at, minStart) {
   let start = minStart === undefined ? at : minStart;
   let seg = s.slice(start, at);
   let m = /[A-Za-z0-9._+-]*$/.exec(seg);
-  return at - (m ? m[0].length : 0);
+  let localLen = m ? m[0].length : 0;
+  return at - localLen;
 }
 // Try the email regex without the lookahead at `ls`; accept the longer
 // match only when it ends before a '_' with a '_' opener before the
@@ -1251,7 +1260,8 @@ function emailLongerEnd(s, ls, n, end, allowEnd) {
   let end2 = ls + m2[0].length;
   if (end2 <= end) return -1;
   if (end2 >= n) return allowEnd ? end2 : -1;
-  if (s.charCodeAt(end2) === 95 && hasUnderscoreOpener(s, ls)) return end2;
+  let endsBeforeUnderscore = s.charCodeAt(end2) === 95;
+  if (endsBeforeUnderscore && hasUnderscoreOpener(s, ls)) return end2;
   return -1;
 }
 
@@ -1286,16 +1296,14 @@ function matchEmailAt(s, at, n, minStart) {
   // ends right before a '.' (the dropped group's dot). Re-match without
   // the lookahead and take the longer match when it ends before a '_'
   // with a '_' opener before the email.
-  if (end < n && s.charCodeAt(end) === 46) {
+  let endsBeforeDot = end < n && s.charCodeAt(end) === 46;
+  if (endsBeforeDot) {
     let end2 = emailLongerEnd(s, ls, n, end, false);
     if (end2 !== -1) return { start: ls, end: end2 };
   }
   return { start: ls, end };
 }
 function hasUrlScheme(s, i) {
-  if (s.startsWith('http://', i) || s.startsWith('https://', i) || s.startsWith('ftp://', i)) return true;
-  if (s.startsWith('HTTP://', i) || s.startsWith('HTTPS://', i) || s.startsWith('FTP://', i)) return true;
-  // case-insensitive scheme check (the broad regex handles the rest)
   let head = s.slice(i, i + 8).toLowerCase();
   if (head.startsWith('http://') || head.startsWith('https://') || head.startsWith('ftp://')) return true;
   return false;
@@ -1310,10 +1318,11 @@ function mailtoAutolinkHtml(s, i, end) {
 }
 // Extend an xmpp: email end with one /path segment of [A-Za-z0-9@.]+.
 function extendXmppPath(s, end, n) {
-  if (!(end < n) || s.charCodeAt(end) !== 47) return end; // '/'
+  if (end >= n || s.charCodeAt(end) !== 47) return end; // '/'
   let j = end + 1;
   while (j < n && /[A-Za-z0-9@.]/.test(s[j])) j += 1;
-  return j > end + 1 ? j : end;
+  if (j > end + 1) return j;
+  return end;
 }
 // mailto: / xmpp: + email (GFM emailProtocol branch; the whole
 // "mailto:foo@bar.baz" is the link, href and text alike). xmpp: may
@@ -1868,9 +1877,9 @@ function backslashInUrl(src, textStart, i, n) {
 // Measure the backtick run starting at src[i]: returns {len, end}
 // where end is the index just past the run.
 function measureBacktickRun(src, i, n) {
-  let e = i;
-  while (e < n && src.charCodeAt(e) === 96) e += 1;
-  return { len: e - i, end: e };
+  let end = i;
+  while (end < n && src.charCodeAt(end) === 96) end += 1;
+  return { len: end - i, end };
 }
 
 // Skip a raw HTML tag or angle autolink starting at src[i]. Returns the
@@ -1896,6 +1905,17 @@ function findEqualRun(src, from, to, len) {
   return -1;
 }
 
+// Does the code-span content [contentStart, contentEnd) contain a
+// backtick? (A 2+ span whose content holds a backtick is "unclean".)
+function codeSpanContentHasBacktick(src, contentStart, contentEnd) {
+  let p = contentStart;
+  while (p < contentEnd) {
+    if (src.charCodeAt(p) === 96) return true;
+    p += 1;
+  }
+  return false;
+}
+
 // Equal-length code-span pairing over src: each backtick run opens a
 // span closing at the next run of the SAME length; unpaired runs are
 // literal. Raw HTML tags / autolinks are skipped (backticks inside a
@@ -1916,8 +1936,6 @@ function codeSpanRegions(src) {
     if (c === 60) {
       let after = skipInlineTag(src, i, n);
       if (after !== -1) { i = after; continue; }
-      i += 1;
-      continue;
     }
     i += 1;
   }
@@ -1936,21 +1954,14 @@ function linkTextTrigger(text) {
     if (text.charCodeAt(i) !== 96) { i += 1; continue; }
     let run = measureBacktickRun(text, i, n);
     let end = findEqualRun(text, run.end, n, run.len);
-    if (end !== -1) {
-      if (run.len >= 2) {
-        // does the span content contain a backtick?
-        let p = run.end;
-        while (p < end - run.len) {
-          if (text.charCodeAt(p) === 96) { unclean2 = true; break; }
-          p += 1;
-        }
-      }
-      i = end;
-    } else {
+    if (end === -1) {
       if (run.len === 1) lit1 = true;
       else lit2 = true;
       i = run.end;
+      continue;
     }
+    if (run.len >= 2 && codeSpanContentHasBacktick(text, run.end, end - run.len)) unclean2 = true;
+    i = end;
   }
   return lit1 && (lit2 || unclean2);
 }
@@ -1963,12 +1974,11 @@ function findBracketCloseLenient(s, i, n) {
   let j = i;
   while (j < n) {
     let c = s.charCodeAt(j);
-    if (c === 92) { j = j + 2; continue; }
+    if (c === 92) { j += 2; continue; }
     if (c === 96) {
       let run = measureBacktickRun(s, j, n);
       let close = findEqualRun(s, run.end, n, run.len);
-      if (close !== -1) { j = close; continue; }
-      j = run.end;
+      j = close !== -1 ? close : run.end;
       continue;
     }
     if (c === 60) {
@@ -1978,7 +1988,12 @@ function findBracketCloseLenient(s, i, n) {
       continue;
     }
     if (c === 91) { depth += 1; j += 1; continue; }
-    if (c === 93) { depth -= 1; if (depth === 0) return j; j += 1; continue; }
+    if (c === 93) {
+      depth -= 1;
+      if (depth === 0) return j;
+      j += 1;
+      continue;
+    }
     j += 1;
   }
   return -1;
@@ -1988,11 +2003,12 @@ function findBracketCloseLenient(s, i, n) {
 // honouring backslash escapes. Returns n when unterminated.
 function skipToChar(str, j, n, endCode) {
   let p = j;
-  while (p < n && str.charCodeAt(p) !== endCode) {
-    if (str.charCodeAt(p) === 92) p += 1;
+  while (p < n) {
+    let c = str.charCodeAt(p);
+    if (c === endCode) return p + 1;
+    if (c === 92) p += 1;
     p += 1;
   }
-  if (p < n) p += 1;
   return p;
 }
 
@@ -2003,9 +2019,14 @@ function findParenClose(s, i, n) {
   let j = i;
   while (j < n) {
     let c = s.charCodeAt(j);
-    if (c === 92) { j = j + 2; continue; }
+    if (c === 92) { j += 2; continue; }
     if (c === 40) { depth += 1; j += 1; continue; }
-    if (c === 41) { depth -= 1; if (depth === 0) return j; j += 1; continue; }
+    if (c === 41) {
+      depth -= 1;
+      if (depth === 0) return j;
+      j += 1;
+      continue;
+    }
     if (c === 34 || c === 39) { j = skipToChar(s, j + 1, n, c); continue; }
     if (c === 60) { j = skipToChar(s, j + 1, n, 62); continue; }
     j += 1;
@@ -2022,14 +2043,9 @@ function hasUncleanCodeSpan(src, from, to) {
     let run = measureBacktickRun(src, i, to);
     if (run.len < 2) { i = run.end; continue; }
     let end = findEqualRun(src, run.end, to, run.len);
-    if (end !== -1) {
-      let p = run.end;
-      while (p < end - run.len) {
-        if (src.charCodeAt(p) === 96) return true;
-        p += 1;
-      }
-      i = end;
-    } else i = run.end;
+    if (end === -1) { i = run.end; continue; }
+    if (codeSpanContentHasBacktick(src, run.end, end - run.len)) return true;
+    i = end;
   }
   return false;
 }
