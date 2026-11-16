@@ -2526,13 +2526,23 @@ function bulletMarkerLen(str) {
   return 0;
 }
 // Parse an ordered marker (1-9 digits + '.' or ')') at str[0].
-// Returns {len, start} or null.
+// Returns {len, start} or null. The digits are scanned by hand: at
+// most 9 of them, then the delimiter must follow immediately (a
+// 10-digit run cannot match, since the 10th digit is not a delimiter).
 function orderedMarker(str) {
-  let m = /^(\d{1,9})([.)])/.exec(str);
-  if (!m) return null;
-  let value = parseInt(m[1], 10);
+  let idx = 0;
+  while (idx < str.length && idx < 9) {
+    let code = str.charCodeAt(idx);
+    if (code < 48 || code > 57) break;
+    idx += 1;
+  }
+  if (idx === 0) return null;
+  if (idx >= str.length) return null;
+  let delim = str.charCodeAt(idx);
+  if (delim !== 46 && delim !== 41) return null;
+  let value = parseInt(str.slice(0, idx), 10);
   if (value > 999999999) return null;
-  return { len: m[0].length, start: value };
+  return { len: idx + 1, start: value };
 }
 // Whitespace columns after the marker (tabs to next multiple of 4).
 // Returns {cols, idx} where idx is the first non-whitespace index.
@@ -2542,9 +2552,15 @@ function markerWs(str, from, startCol) {
   let wsCols = 0;
   while (idx < str.length) {
     let code = str.charCodeAt(idx);
-    if (code === 32) { wsCols += 1; column += 1; idx += 1; }
-    else if (code === 9) { let nextCol = nextTabStop(column); wsCols += nextCol - column; column = nextCol; idx += 1; }
-    else break;
+    if (code === 32) { wsCols += 1; column += 1; idx += 1; continue; }
+    if (code === 9) {
+      let nextCol = nextTabStop(column);
+      wsCols += nextCol - column;
+      column = nextCol;
+      idx += 1;
+      continue;
+    }
+    break;
   }
   return { cols: wsCols, idx };
 }
@@ -2556,6 +2572,15 @@ function parseListMarkerHead(str) {
   if (!ordered) return null;
   return { ordered: true, start: ordered.start, len: ordered.len };
 }
+// The content indent of a list item from its marker: CommonMark 5.2.
+// N = total whitespace columns after the marker. N==0 -> not a list
+// item. N>=5 -> content indent is W+1 (rule #2, indented-code
+// content). 1<=N<=4 -> content indent W+N. An item with no content
+// after the marker is empty (indent W+1).
+function listContentIndent(startCol, markerLen, wsCols, isEmpty) {
+  if (isEmpty || wsCols >= 5) return startCol + markerLen + 1;
+  return startCol + markerLen + wsCols;
+}
 function matchListMarker(str, startCol) {
   if (str.length === 0) return null;
   let head = parseListMarkerHead(str);
@@ -2565,11 +2590,7 @@ function matchListMarker(str, startCol) {
   // it is at the end of the line (an empty item)
   if (ws.cols === 0 && ws.idx < str.length) return null;
   let isEmpty = ws.idx >= str.length;
-  // CommonMark 5.2: N = total whitespace columns after the marker.
-  // N==0 -> not a list item. N>=5 -> content indent is W+1 (rule #2,
-  // indented-code content). 1<=N<=4 -> content indent W+N.
-  // An item with no content after the marker is empty (indent W+1).
-  let contentIndent = startCol + head.len + (isEmpty || ws.cols >= 5 ? 1 : ws.cols);
+  let contentIndent = listContentIndent(startCol, head.len, ws.cols, isEmpty);
   return { ordered: head.ordered, bullet: str[0], start: head.start, markerLen: head.len, contentIndent, empty: isEmpty };
 }
 
@@ -3362,16 +3383,16 @@ function itemIndentTarget(column, padding, relIndent) {
 // padding} when the line continues the item, or null when it does not.
 function matchItemIndent(raw, cursor, column, padding, relIndent) {
   let indentTarget = itemIndentTarget(column, padding, relIndent);
-  if (indentTarget <= column) {
-    // padding (virtual spaces from a tab expansion in an outer
-    // container) may overlap the item's indent: the first
-    // relIndent padding spaces are the item's indent, not content
-    if (padding > 0) padding -= Math.min(relIndent, padding);
-    return { cursor, column, padding };
+  if (indentTarget > column) {
+    let advanced = advanceCols(raw, cursor, column, indentTarget);
+    if (!advanced) return null;
+    return { cursor: advanced[0], column: advanced[1], padding: advanced[2] };
   }
-  let advanced = advanceCols(raw, cursor, column, indentTarget);
-  if (!advanced) return null;
-  return { cursor: advanced[0], column: advanced[1], padding: advanced[2] };
+  // padding (virtual spaces from a tab expansion in an outer
+  // container) may overlap the item's indent: the first
+  // relIndent padding spaces are the item's indent, not content
+  if (padding > 0) padding -= Math.min(relIndent, padding);
+  return { cursor, column, padding };
 }
 
 // The delimiter char of a matched list marker ('.', ')' for ordered,
@@ -3388,11 +3409,14 @@ function markerDelimiter(marker, text, indent) {
 function listMarkerKeepsList(text, col, container) {
   let indent = indentOf(text, col);
   if (indent >= 4) return null;
-  if (matchHR(text.slice(indent), col + indent)) return 'hr';
-  let marker = matchListMarker(text.slice(indent), col + indent);
+  let rest = text.slice(indent);
+  let restCol = col + indent;
+  if (matchHR(rest, restCol)) return 'hr';
+  let marker = matchListMarker(rest, restCol);
   if (!marker) return null;
   let delim = markerDelimiter(marker, text, indent);
-  if (marker.ordered === container.ordered && delim === container.delimiter) return 'marker';
+  let sameType = marker.ordered === container.ordered;
+  if (sameType && delim === container.delimiter) return 'marker';
   return null;
 }
 
@@ -3400,7 +3424,8 @@ function listMarkerKeepsList(text, col, container) {
 // anything)? True when the item's content indent is already reached,
 // or when advanceCols can reach it.
 function itemContinues(raw, cursor, column, padding, relIndent) {
-  return matchItemIndent(raw, cursor, column, padding, relIndent) !== null;
+  let adv = matchItemIndent(raw, cursor, column, padding, relIndent);
+  return adv !== null;
 }
 
 // Block-start matchers that can end a fenced code block's lazy
