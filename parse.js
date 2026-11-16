@@ -21,30 +21,33 @@
 const ENTITY_DIGIT = new Int8Array(128).fill(-1);
 for (let d = 0; d <= 9; d++) ENTITY_DIGIT[48 + d] = d;
 for (let d = 0; d < 6; d++) { ENTITY_DIGIT[97 + d] = 10 + d; ENTITY_DIGIT[65 + d] = 10 + d; }
-function scanEntityRef(s, i, n) {
-  if (i + 1 >= n) return null;
-  let c1 = s.charCodeAt(i + 1);
-  if (c1 === 35) {
-    let j = i + 2;
-    let hex = j < n && (s.charCodeAt(j) === 120 || s.charCodeAt(j) === 88);
-    if (hex) j += 1;
-    let base = hex ? 16 : 10;
-    let maxD = hex ? 6 : 7;
-    let v = 0;
-    let d = 0;
-    while (j < n && d < maxD) {
-      let c = s.charCodeAt(j);
-      if (c >= 128) break;
-      let dv = ENTITY_DIGIT[c];
-      if (dv < 0 || (!hex && dv > 9)) break;
-      v = v * base + dv;
-      d += 1;
-      j += 1;
-    }
-    if (d === 0 || j >= n || s.charCodeAt(j) !== 59) return null;
-    if (v === 0 || v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) return { named: false, value: '\uFFFD', next: j + 1 };
-    return { named: false, value: String.fromCodePoint(v), next: j + 1 };
+// Scan a numeric character reference (&#123; or &#x7B;) at s[i] ('&').
+// Returns {named: false, value, next} or null.
+function scanNumericEntityRef(s, i, n) {
+  let j = i + 2;
+  let hex = j < n && (s.charCodeAt(j) === 120 || s.charCodeAt(j) === 88);
+  if (hex) j += 1;
+  let base = hex ? 16 : 10;
+  let maxD = hex ? 6 : 7;
+  let v = 0;
+  let d = 0;
+  while (j < n && d < maxD) {
+    let c = s.charCodeAt(j);
+    if (c >= 128) break;
+    let dv = ENTITY_DIGIT[c];
+    if (dv < 0 || (!hex && dv > 9)) break;
+    v = v * base + dv;
+    d += 1;
+    j += 1;
   }
+  if (d === 0 || j >= n || s.charCodeAt(j) !== 59) return null;
+  if (v === 0 || v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF)) return { named: false, value: '\uFFFD', next: j + 1 };
+  return { named: false, value: String.fromCodePoint(v), next: j + 1 };
+}
+// Scan a named entity reference (&name;) at s[i] ('&'). Returns
+// {named: true, value, next} or null.
+function scanNamedEntityRef(s, i, n) {
+  let c1 = s.charCodeAt(i + 1);
   if (!((c1 >= 65 && c1 <= 90) || (c1 >= 97 && c1 <= 122))) return null;
   let j = i + 1;
   while (j < n) {
@@ -55,6 +58,12 @@ function scanEntityRef(s, i, n) {
   }
   if (j >= n || s.charCodeAt(j) !== 59) return null;
   return { named: true, value: s.slice(i, j + 1), next: j + 1 };
+}
+function scanEntityRef(s, i, n) {
+  if (i + 1 >= n) return null;
+  let c1 = s.charCodeAt(i + 1);
+  if (c1 === 35) return scanNumericEntityRef(s, i, n);
+  return scanNamedEntityRef(s, i, n);
 }
 
 // ---------------------------------------------------------------------------
@@ -77,11 +86,12 @@ function isPunct(c) { return c < 128 && (CHAR_CLASS[c] & 2) !== 0; }
 function isDigit(c) { return c < 128 && (CHAR_CLASS[c] & 4) !== 0; }
 function isAlphaNum(c) { return c < 128 && (CHAR_CLASS[c] & 12) !== 0; }
 // Unicode whitespace (CommonMark): space, tab, LF, FF, CR + Unicode spaces.
+const UNICODE_SPACE_SET = new Set([0xA0, 0x1680, 0x202F, 0x205F, 0x3000]);
 function isUnicodeSpace(ch) {
   let c = ch.charCodeAt(0);
   if (c === 32 || (c >= 9 && c <= 13)) return true;
-  if (c === 0xA0 || c === 0x1680 || c === 0x202F || c === 0x205F || c === 0x3000) return true;
-  return c >= 0x2000 && c <= 0x200A;
+  if (c >= 0x2000 && c <= 0x200A) return true;
+  return UNICODE_SPACE_SET.has(c);
 }
 // Unicode punctuation: ASCII punct + Unicode P* and S* categories (approx:
 // everything that is not a letter, digit, space or combining mark). We use a
@@ -96,12 +106,8 @@ const UNICODE_LETTER_RANGES = [
   [0x600, 0x6FF], [0x900, 0x97F], [0x3040, 0x30FF], [0x3400, 0x4DBF],
   [0x4E00, 0x9FFF], [0xAC00, 0xD7AF], [0xFF00, 0xFFEF],
 ];
-function isUnicodePunct(ch) {
-  if (ch.length === 0) return true;
-  let c = ch.charCodeAt(0);
-  if (c < 128) return isPunct(c);
-  // Letters (incl. accents, CJK, Greek, Cyrillic, Hebrew, Arabic...) are not
-  // punctuation; digits are not; everything else counts as punctuation.
+// Is code point `c` inside one of the letter ranges (binary search)?
+function isInLetterRanges(c) {
   let lo = 0;
   let hi = UNICODE_LETTER_RANGES.length - 1;
   while (lo <= hi) {
@@ -109,9 +115,17 @@ function isUnicodePunct(ch) {
     let r = UNICODE_LETTER_RANGES[mid];
     if (c < r[0]) hi = mid - 1;
     else if (c > r[1]) lo = mid + 1;
-    else return false;
+    else return true;
   }
-  return true;
+  return false;
+}
+function isUnicodePunct(ch) {
+  if (ch.length === 0) return true;
+  let c = ch.charCodeAt(0);
+  if (c < 128) return isPunct(c);
+  // Letters (incl. accents, CJK, Greek, Cyrillic, Hebrew, Arabic...) are not
+  // punctuation; digits are not; everything else counts as punctuation.
+  return !isInLetterRanges(c);
 }
 
 const ESCAPE_FOR = { 38: '&amp;', 60: '&lt;', 62: '&gt;', 34: '&quot;', 39: '&#39;' };
@@ -129,16 +143,14 @@ function escapeRun(s, out, attr) {
   if (!NEED_ESCAPE.test(s)) { out[out.length] = s; return; }
   let n = s.length;
   let start = 0;
-  let i = 0;
-  while (i < n) {
+  for (let i = 0; i < n; i += 1) {
     let c = s.charCodeAt(i);
-    if (c === 38 && attr && scanEntityRef(s, i, n) !== null) { i += 1; continue; }
+    if (c === 38 && attr && scanEntityRef(s, i, n) !== null) continue;
     let rep = ESCAPE_FOR[c];
-    if (rep === undefined) { i += 1; continue; }
+    if (rep === undefined) continue;
     if (start < i) out[out.length] = s.slice(start, i);
     out[out.length] = rep;
     start = i + 1;
-    i += 1;
   }
   if (start < n) out[out.length] = s.slice(start);
 }
@@ -265,6 +277,20 @@ function markStrongOpeners(delims) {
   }
 }
 
+// Is a len-1 opener nested inside a len>=2 opener (e.g. `*...*` inside
+// `**...**`)? Such an opener cannot close at a len>=2 closer: that
+// closer belongs to the enclosing strong, so its scope ends before it.
+function openerInsideStrong(delims, i, ch) {
+  let s = i - 1;
+  while (s >= 0) {
+    let od = delims[s];
+    if (od && od.ch === ch && od.open && od.len >= 2) return true;
+    if (od && od.ch === ch && od.close && od.len >= 2) return false;
+    s -= 1;
+  }
+  return false;
+}
+
 // Run the m-balance from delimiter index i with opener run length k
 // and total run length y. Returns {res: 0 (never closes), 1 (em),
 // 2 (strong), skipped: whether a both-flanking closer was skipped
@@ -280,16 +306,7 @@ function scanCloses(delims, i, ch, k, y) {
   // A len-1 opener nested inside a len>=2 opener (e.g. `*...*` inside
   // `**...**`) cannot close at a len>=2 closer: that closer belongs
   // to the enclosing strong. Its scope ends before such a closer.
-  let insideStrong = false;
-  if (opener.len === 1) {
-    let s = i - 1;
-    while (s >= 0) {
-      let od = delims[s];
-      if (od && od.ch === ch && od.open && od.len >= 2) { insideStrong = true; break; }
-      if (od && od.ch === ch && od.close && od.len >= 2) break;
-      s -= 1;
-    }
-  }
+  let insideStrong = opener.len === 1 && openerInsideStrong(delims, i, ch);
   let t = i + 1;
   while (t < delims.length) {
     let d = delims[t];
@@ -320,10 +337,23 @@ function scanCloses(delims, i, ch, k, y) {
   return [0, f > 0];
 }
 
+const EMPHASIS_CHARS = ['*', '_', '~'];
 function resetEmphasisFloors(floor) {
-  floor['*'] = -1;
-  floor['_'] = -1;
-  floor['~'] = -1;
+  for (let ch of EMPHASIS_CHARS) floor[ch] = -1;
+}
+
+// Can a '~' opener of this length match a closer of the given length?
+// The regex backreferences the opener's length, so the two runs must
+// have the SAME length, and it must be 1 or 2 (a longer run leaves a
+// '~' adjacent to the delimiter, failing the lookahead).
+function tildeMatchOk(candLen, closerLen) {
+  return candLen === closerLen && candLen <= 2;
+}
+// Does the rule of 3 allow this opener/closer pair?
+function ruleOfThreeOk(cand, closer) {
+  let oddMatch = (cand.open && cand.close) || (closer.open && closer.close);
+  if (!oddMatch) return true;
+  return (cand.len + closer.len) % 3 !== 0 || (cand.len % 3 === 0 && closer.len % 3 === 0);
 }
 
 function findEmphasisOpener(delims, closeAt, closer, floor, isSuppressed) {
@@ -335,14 +365,10 @@ function findEmphasisOpener(delims, closeAt, closer, floor, isSuppressed) {
     let cand = delims[at];
     if (cand && cand.ch === ch && cand.open) {
       seen = true;
-      // '~' (strikethrough): the regex backreferences the opener's
-      // length, so the two runs must have the SAME length, and it must
-      // be 1 or 2 (a longer run leaves a '~' adjacent to the delimiter,
-      // failing the lookahead). Otherwise this opener cannot match.
-      if (ch === '~' && (cand.len !== closer.len || cand.len > 2)) { at -= 1; continue; }
-      let oddMatch = (cand.open && cand.close) || (closer.open && closer.close);
-      let ruleOk = !oddMatch || (cand.len + closer.len) % 3 !== 0 || (cand.len % 3 === 0 && closer.len % 3 === 0);
-      if (ruleOk) {
+      // '~' (strikethrough): the two runs must have the SAME length,
+      // and it must be 1 or 2. Otherwise this opener cannot match.
+      if (ch === '~' && !tildeMatchOk(cand.len, closer.len)) { at -= 1; continue; }
+      if (ruleOfThreeOk(cand, closer)) {
         // A lone close-only run must not steal one delimiter from a
         // '**' opener that the m-balance says closes as strong.
         if (cand.len === 2 && closer.len === 1 && !closer.open && !cand.close && cand.expectsStrong) { at -= 1; continue; }
