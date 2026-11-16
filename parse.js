@@ -1306,6 +1306,8 @@ function underscoreInEmailDomain(s, i, n) {
   return em.start <= i && i < em.end;
 }
 
+// URL schemes recognised before '://', longest first.
+const URL_SCHEMES = ['https', 'http', 'ftp'];
 // Find the start of a URL (www. or scheme://) at or after `from`,
 // searching only before index `limit`. Returns the start index or -1,
 // and advances `state.pos` past a rejected candidate.
@@ -1314,14 +1316,41 @@ function findUrlStart(s, from, limit, state) {
   let c = s.indexOf('://', from);
   if (w !== -1 && w < limit && (c === -1 || w <= c)) return w;
   if (c === -1 || c >= limit) return -1;
-  let before = s.slice(c - 5, c).toLowerCase();
-  if (before === 'https') return c - 5;
-  before = s.slice(c - 4, c).toLowerCase();
-  if (before === 'http') return c - 4;
-  before = s.slice(c - 3, c).toLowerCase();
-  if (before === 'ftp') return c - 3;
+  for (let scheme of URL_SCHEMES) {
+    if (s.slice(c - scheme.length, c).toLowerCase() === scheme) return c - scheme.length;
+  }
   state.pos = c + 3;
   return -2;
+}
+
+// Is the char before a 'www.' start a valid URL boundary? (A 'www.'
+// preceded by a non-space char that is not a delimiter or '(' is part
+// of a larger token, not a URL start.)
+function wwwPrevOk(s, us) {
+  let prev = us > 0 ? s[us - 1] : '';
+  return prev === '' || isUnicodeSpace(prev) || prev === '*' || prev === '_' || prev === '~' || prev === '(';
+}
+
+// A URL that is a link destination [text](url) ends at the paren
+// matching the '(' before it: a delimiter after that ')' (e.g. an
+// emphasis closer) is outside the URL, even when the broad match
+// runs on into later text whose balanced parens make the backpedal
+// keep the whole run (e.g. [i](https://e.com)*](https://x.org)).
+// Returns the index of the matching ')' or -1.
+function linkDestCloseParen(s, us, n) {
+  if (us < 2 || s.charCodeAt(us - 1) !== 40 || s.charCodeAt(us - 2) !== 93) return -1;
+  let depth = 0;
+  let k = us - 1;
+  while (k < n) {
+    let ck = s.charCodeAt(k);
+    if (ck === 40) depth += 1;
+    else if (ck === 41) {
+      depth -= 1;
+      if (depth === 0) return k;
+    }
+    k += 1;
+  }
+  return -1;
 }
 
 // Is the delimiter at s[i] inside a bare extended-autolink URL? Scan back
@@ -1345,36 +1374,15 @@ function delimInUrl(s, i, n) {
     let us = findUrlStart(s, p, i, state);
     if (us === -2) { p = state.pos; continue; }
     if (us === -1) break;
-    if (s.startsWith('www.', us)) {
-      let prev = us > 0 ? s[us - 1] : '';
-      if (prev !== '' && !isUnicodeSpace(prev) && prev !== '*' && prev !== '_' && prev !== '~' && prev !== '(') {
-        p = us + 4;
-        continue;
-      }
+    if (s.startsWith('www.', us) && !wwwPrevOk(s, us)) {
+      p = us + 4;
+      continue;
     }
     let end0 = matchUrlAt(s, us, n);
     if (end0 !== -1) {
       let end = end0;
-      // a URL that is a link destination [text](url) ends at the paren
-      // matching the '(' before it: a delimiter after that ')' (e.g. an
-      // emphasis closer) is outside the URL, even when the broad match
-      // runs on into later text whose balanced parens make the backpedal
-      // keep the whole run (e.g. [i](https://e.com)*](https://x.org))
-      if (us >= 2 && s.charCodeAt(us - 1) === 40 && s.charCodeAt(us - 2) === 93) {
-        let depth = 0;
-        let closeAt = -1;
-        let k = us - 1;
-        while (k < n) {
-          let ck = s.charCodeAt(k);
-          if (ck === 40) depth += 1;
-          else if (ck === 41) {
-            depth -= 1;
-            if (depth === 0) { closeAt = k; break; }
-          }
-          k += 1;
-        }
-        if (closeAt !== -1 && closeAt < end) end = closeAt;
-      }
+      let closeAt = linkDestCloseParen(s, us, n);
+      if (closeAt !== -1 && closeAt < end) end = closeAt;
       if (i < end) return true;
       p = end; // skip past this URL; a www. inside it is not a new start
       continue;
@@ -2328,14 +2336,15 @@ function matchHtmlBlock(str, startCol) {
 // from the next by a blank line, or ends with two blank lines (i.e. any
 // item other than the last ends with a blank line, or any item contains
 // two block children separated by a blank line).
+// A list is tight when it is not loose and no item (except the last)
+// ends with a blank line and no item has a blank line between its
+// blocks.
 function computeTight(listNode) {
   if (listNode.loose) return false;
-  let idx = 0;
-  while (idx < listNode.children.length) {
+  for (let idx = 0; idx < listNode.children.length; idx += 1) {
     let itemNode = listNode.children[idx];
     if (itemNode.endsWithBlank && idx < listNode.children.length - 1) return false;
     if (itemNode.hasBlankBetween) return false;
-    idx += 1;
   }
   return true;
 }
@@ -2718,6 +2727,24 @@ function matchBlockquote(raw, cursor, column, padding, openStack, stackIdx) {
   return { matched: true, cursor, column, padding, matchedDepth, stop: false };
 }
 
+// Does an indented code block continue past a blank line at `scanLine`?
+// A blank line is part of the code only when a later non-blank line
+// still belongs to the block (indented >= 4 after the containers).
+// Returns the later line's stripped form, or null.
+function indentedCodeContinues(sourceLines, scanLine, openStack) {
+  let lookahead = scanLine + 1;
+  while (lookahead < sourceLines.length) {
+    let later = stripContainersForLine(sourceLines[lookahead], openStack);
+    if (!later) return null;
+    if (!isBlankStr(later.text)) {
+      if (indentOf(later.text, later.col) >= 4) return later;
+      return null;
+    }
+    lookahead += 1;
+  }
+  return null;
+}
+
 // Consume the lines following an indented code block's first line.
 // Returns the scan line just past the block (trailing blank lines are
 // dropped from the block's lines).
@@ -2732,15 +2759,8 @@ function consumeIndentedCode(sourceLines, fromLine, openStack, blockNode) {
       // non-blank line still belongs to the block (indented >= 4
       // after the containers); its spaces beyond the 4-column
       // indent are kept (cm-112)
-      let lookahead = scanLine + 1;
-      let laterMatch = null;
-      while (lookahead < sourceLines.length) {
-        let later = stripContainersForLine(sourceLines[lookahead], openStack);
-        if (!later) break;
-        if (!isBlankStr(later.text)) { laterMatch = later; break; }
-        lookahead += 1;
-      }
-      if (laterMatch && indentOf(laterMatch.text, laterMatch.col) >= 4) {
+      let laterMatch = indentedCodeContinues(sourceLines, scanLine, openStack);
+      if (laterMatch) {
         blockNode.lines.push(stripIndent(stripped.text, stripped.col, 4) ?? '');
         scanLine += 1;
         continue;
@@ -3005,6 +3025,16 @@ function consumeFencedCode(sourceLines, fromLine, openStack, fenceInfo, lineText
 // Consume the lines of an HTML block after its opening line. Returns
 // {scanLine, seenBlank}: seenBlank is true when a blank line ended a
 // type 6-7 block.
+// For HTML block types 1-5: every line is content until the closing
+// marker. Returns true when this line contains the marker (the block
+// ends after it).
+function htmlBlockLineEnds(stripped, endMarker) {
+  return stripped.text.toLowerCase().includes(endMarker);
+}
+
+// Consume the lines of an HTML block after its opening line. Returns
+// {scanLine, seenBlank}: seenBlank is true when a blank line ended a
+// type 6-7 block.
 function consumeHtmlBlockLines(sourceLines, fromLine, openStack, endMarker, blockNode) {
   let scanLine = fromLine;
   let seenBlank = false;
@@ -3015,8 +3045,8 @@ function consumeHtmlBlockLines(sourceLines, fromLine, openStack, endMarker, bloc
     if (endMarker) {
       // types 1-5: every line is content until the closing marker
       blockNode.lines.push(stripped.text);
-      if (stripped.text.toLowerCase().includes(endMarker)) { scanLine += 1; break; }
       scanLine += 1;
+      if (htmlBlockLineEnds(stripped, endMarker)) break;
       continue;
     }
     // types 6-7: a blank line ends the block
@@ -3654,6 +3684,16 @@ function pushTaskCheckbox(block, html) {
   else if (block.task === 1) html.push('<input checked="" disabled="" type="checkbox"> ');
 }
 
+// The text of a code block: lines joined by '\n', ending with exactly
+// one trailing '\n' when non-empty (a fenced block's trailing blank
+// lines contribute only up to that one newline; an empty block has none).
+function codeBlockText(lines) {
+  let codeText = lines.join('\n');
+  if (codeText.length === 0) return codeText;
+  if (codeText.endsWith('\n')) return codeText;
+  return codeText + '\n';
+}
+
 function renderCodeBlock(block, html) {
   html.push('<pre><code');
   if (block.lang) {
@@ -3662,35 +3702,39 @@ function renderCodeBlock(block, html) {
     html.push('"');
   }
   html.push('>');
-  // escape the code text directly (no entities in code blocks).
-  // The content is the lines joined by '\n'; the output ends with
-  // exactly one trailing '\n' when the block is non-empty (a fenced
-  // block's trailing blank lines contribute only up to that one
-  // newline; an empty block has none).
-  let codeText = block.lines.join('\n');
-  escapeText(codeText.length > 0 ? (codeText.endsWith('\n') ? codeText : codeText + '\n') : codeText, html);
+  // escape the code text directly (no entities in code blocks)
+  escapeText(codeBlockText(block.lines), html);
   html.push('</code></pre>\n');
 }
 
-function renderHtmlBlock(block, html) {
-  // an HTML block's lines are output verbatim; trailing blank lines
-  // (and the blank line that ends the block) do not contribute.
-  // A block terminated by a blank line has no trailing newline;
-  // one terminated by EOF, another block, or its closing tag does.
+// An HTML block's lines output verbatim; trailing blank lines
+// (spaces-only lines at the end) do not contribute.
+function htmlBlockText(block) {
   let htmlText = block.lines.join('\n');
   // strip trailing blank lines (spaces-only lines at the end)
   htmlText = htmlText.replace(/[ \t]*(\n[ \t]*)+$/, '');
+  return htmlText;
+}
+
+function renderHtmlBlock(block, html) {
+  // A block terminated by a blank line has no trailing newline;
+  // one terminated by EOF, another block, or its closing tag does.
+  let htmlText = htmlBlockText(block);
   if (htmlText.length > 0) html.push(htmlText);
   if (block.trailingNL !== false) html.push('\n');
+}
+
+// Render one table cell (<th> or <td>) with its alignment attribute.
+function renderTableCell(tag, content, align, linkDefs, html) {
+  html.push('<' + tag + (align ? ' align="' + align + '"' : '') + '>');
+  parseInline(content, linkDefs, html, false, null);
+  html.push('</' + tag + '>\n');
 }
 
 function renderTable(block, linkDefs, html) {
   html.push('<table>\n<thead>\n<tr>\n');
   for (let idx = 0; idx < block.header.length; idx += 1) {
-    let align = block.aligns[idx];
-    html.push('<th' + (align ? ' align="' + align + '"' : '') + '>');
-    parseInline(block.header[idx], linkDefs, html, false, null);
-    html.push('</th>\n');
+    renderTableCell('th', block.header[idx], block.aligns[idx], linkDefs, html);
   }
   html.push('</tr>\n</thead>\n');
   // a table with no body rows has no <tbody> at all (gfm-205)
@@ -3700,24 +3744,27 @@ function renderTable(block, linkDefs, html) {
     let row = block.rows[rowIdx];
     html.push('<tr>\n');
     for (let cellIdx = 0; cellIdx < block.header.length; cellIdx += 1) {
-      let align = block.aligns[cellIdx];
-      html.push('<td' + (align ? ' align="' + align + '"' : '') + '>');
-      parseInline(row[cellIdx], linkDefs, html, false, null);
-      html.push('</td>\n');
+      renderTableCell('td', row[cellIdx], block.aligns[cellIdx], linkDefs, html);
     }
     html.push('</tr>\n');
   }
   html.push('</tbody></table>\n');
 }
 
+// The opening tag of a list ('<ul>', '<ol>', or '<ol start="N">').
+function listOpenTag(block) {
+  let tagName = block.ordered ? 'ol' : 'ul';
+  if (block.ordered && block.start !== undefined && block.start !== 1) {
+    return '<' + tagName + ' start="' + block.start + '">';
+  }
+  return '<' + tagName + '>';
+}
+
 function renderList(block, linkDefs, html) {
   let tight = computeTight(block);
   let tagName = block.ordered ? 'ol' : 'ul';
-  html.push('<' + tagName);
-  if (block.ordered && block.start !== undefined && block.start !== 1) {
-    html.push(' start="' + block.start + '"');
-  }
-  html.push('>\n');
+  html.push(listOpenTag(block));
+  html.push('\n');
   for (let idx = 0; idx < block.children.length; idx += 1) {
     renderItem(block.children[idx], linkDefs, html, tight);
   }
@@ -3727,14 +3774,16 @@ function renderList(block, linkDefs, html) {
 // ---------------------------------------------------------------------------
 // Render the block tree to HTML
 // ---------------------------------------------------------------------------
+// Render a list of child blocks in order.
+function renderChildren(children, linkDefs, html) {
+  for (let idx = 0; idx < children.length; idx += 1) {
+    renderBlock(children[idx], linkDefs, html);
+  }
+}
 // Block renderers, keyed by block type. Each takes (block, linkDefs, html).
 const BLOCK_RENDERERS = {
   document(block, linkDefs, html) {
-    let idx = 0;
-    while (idx < block.children.length) {
-      renderBlock(block.children[idx], linkDefs, html);
-      idx += 1;
-    }
+    renderChildren(block.children, linkDefs, html);
   },
   paragraph(block, linkDefs, html) {
     html.push('<p>');
@@ -3758,11 +3807,7 @@ const BLOCK_RENDERERS = {
   },
   blockquote(block, linkDefs, html) {
     html.push('<blockquote>\n');
-    let idx = 0;
-    while (idx < block.children.length) {
-      renderBlock(block.children[idx], linkDefs, html);
-      idx += 1;
-    }
+    renderChildren(block.children, linkDefs, html);
     html.push('</blockquote>\n');
   },
   list(block, linkDefs, html) {
@@ -3790,6 +3835,17 @@ function applyTaskMarker(listItem) {
   else if (marker === 'x' || marker === 'X') { children[0].task = 1; children[0].text = firstText.slice(4); }
 }
 
+// Render one child of a list item. In a tight list, a paragraph child
+// renders inline (no <p> wrapper, no trailing newline).
+function renderItemChild(child, linkDefs, html, isTight) {
+  if (child.type === 'paragraph' && isTight) {
+    pushTaskCheckbox(child, html);
+    parseInline(child.text, linkDefs, html, false, null);
+  } else {
+    renderBlock(child, linkDefs, html);
+  }
+}
+
 // Render a list item. In a tight list, a paragraph child is rendered
 // without the <p> wrapper (its inline content only); in a loose list it
 // keeps the <p> wrapper. A tight list item containing a single paragraph
@@ -3805,13 +3861,7 @@ function renderItem(listItem, linkDefs, html, isTight) {
   // (no <p> wrapper, no trailing newline), and no extra newline is ever
   // added between children -- blocks carry their own trailing newline
   for (let idx = 0; idx < children.length; idx += 1) {
-    let child = children[idx];
-    if (child.type === 'paragraph' && isTight) {
-      pushTaskCheckbox(child, html);
-      parseInline(child.text, linkDefs, html, false, null);
-    } else {
-      renderBlock(child, linkDefs, html);
-    }
+    renderItemChild(children[idx], linkDefs, html, isTight);
   }
   html.push('</li>\n');
 }
@@ -3819,19 +3869,25 @@ function renderItem(listItem, linkDefs, html, isTight) {
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+// Normalise line endings (CRLF/CR -> LF) and NULs (replacement char),
+// then split into lines, dropping the final empty line a trailing
+// newline produces (it is not a real line). Returns {lines, endsNL}.
+function splitInput(input) {
+  input = input.replace(/\r\n?/g, '\n').replace(/\u0000/g, '\uFFFD');
+  let sourceLines = input.split('\n');
+  if (sourceLines.length > 0 && sourceLines[sourceLines.length - 1] === '') sourceLines.pop();
+  return { lines: sourceLines, endsNL: input.endsWith('\n') };
+}
+
 // parse(input): render Markdown to HTML, byte-identical to marked 18.1.3
 // (with headerIds off, mangle off, GFM on) on the test cases.
 function parse(input) {
-  // normalise line endings and NULs
-  input = input.replace(/\r\n?/g, '\n').replace(/\u0000/g, '\uFFFD');
-  let sourceLines = input.split('\n');
-  // a trailing newline produces a final empty line that is not a real line
-  if (sourceLines.length > 0 && sourceLines[sourceLines.length - 1] === '') sourceLines.pop();
+  let split = splitInput(input);
   // fresh per-document inline state (inLink is set by raw <a> tags and
   // must not leak from a previous document)
   inLink = false;
   let linkDefs = new Map();
-  let rootDoc = parseBlocks(sourceLines, linkDefs, input.endsWith('\n'));
+  let rootDoc = parseBlocks(split.lines, linkDefs, split.endsNL);
   let html = [];
   renderBlock(rootDoc, linkDefs, html);
   return html.join('');
