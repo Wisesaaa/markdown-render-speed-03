@@ -1203,16 +1203,22 @@ function angleSchemeHref(inner, colon) {
   return inner;
 }
 
-function tryAngleAutolink(s, i, n) {
-  // find the closing '>' (no whitespace/control, '<' or '>' inside)
+// Find the closing '>' of an angle autolink starting at s[i] (the
+// '<'). No whitespace/control, '<' or '>' may appear inside. Returns
+// the index of the '>', or -1 when there is none.
+function findAngleClose(s, i, n) {
   let j = i + 1;
   while (j < n) {
     let c = s.charCodeAt(j);
-    if (c === 62) break; // '>'
-    if (c <= 32 || c === 60) return null;
+    if (c === 62) return j; // '>'
+    if (c <= 32 || c === 60) return -1;
     j += 1;
   }
-  if (j >= n) return null;
+  return -1;
+}
+function tryAngleAutolink(s, i, n) {
+  let j = findAngleClose(s, i, n);
+  if (j === -1) return null;
   let inner = s.slice(i + 1, j);
   let colon = inner.indexOf(':');
   if (colon !== -1) {
@@ -1278,36 +1284,33 @@ function matchUrlAt(s, i, n) {
 // single-pass scan sees it, so we replicate the effect here: a trailing
 // '_' after an email is a closer (not part of the address) exactly when
 // a matching opener exists before the email.
-// Is there a '_' before index `upto` in `s` that can open an emphasis?
-// A '_' opens when it is left-flanking and (not right-flanking, or the
-// char before it is punctuation) -- the same canOpen rule parseInline
-// uses for '_'. Marked resolves emphasis before matching emails, so a
-// '_' closer after an email is invisible to its email regex; our
-// single-pass scan sees it, so we replicate the effect here: a trailing
-// '_' after an email is a closer (not part of the address) exactly when
-// a matching opener exists before the email.
 function hasUnderscoreOpener(s, upto) {
-  let i = 0;
-  while (i < upto) {
-    if (s.charCodeAt(i) !== 95) { i += 1; continue; }
+  for (let i = 0; i < upto; i += 1) {
+    if (s.charCodeAt(i) !== 95) continue;
     let before = i > 0 ? s[i - 1] : '';
     let after = i + 1 < s.length ? s[i + 1] : '';
     let flank = flanking(before, after);
     let canOpen = flank[0] && (!flank[1] || isUnicodePunct(before));
     if (canOpen) return true;
-    i += 1;
   }
   return false;
 }
 
 // Scan the email local part back from `at` over [A-Za-z0-9._+-],
-// clamped to `minStart`. Returns the start index.
+// clamped to `minStart`. Returns the start index. When no clamp is
+// given the local part is empty (the caller passes the '@' position
+// as `at` and expects the scan to start there).
 function emailLocalStart(s, at, minStart) {
-  let start = minStart === undefined ? at : minStart;
-  let seg = s.slice(start, at);
-  let m = /[A-Za-z0-9._+-]*$/.exec(seg);
-  let localLen = m ? m[0].length : 0;
-  return at - localLen;
+  if (minStart === undefined) return at;
+  let lo = minStart;
+  let start = at;
+  while (start > lo) {
+    let c = s.charCodeAt(start - 1);
+    let ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 46 || c === 95 || c === 43 || c === 45;
+    if (!ok) break;
+    start -= 1;
+  }
+  return start;
 }
 // Try the email regex without the lookahead at `ls`; accept the longer
 // match only when it ends before a '_' with a '_' opener before the
