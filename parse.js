@@ -4097,6 +4097,54 @@ function parseBlocks(sourceLines, linkDefs, endsWithNewline) {
     return true;
   };
 
+  // Try an indented code block starting this line. A paragraph that is
+  // STILL open blocks it (an indented code block cannot interrupt a
+  // paragraph); a paragraph closed by a blank line does not. Returns
+  // the scan line just past the block, or null when this line is not
+  // an indented code block.
+  const tryIndentedCode = (text, col, lineIdx) => {
+    if (activePara) return null;
+    let indent = indentOf(text, col);
+    if (indent < 4) return null;
+    let codeText = stripIndent(text, col, 4);
+    const parentNode = topNode();
+    markLooseAfterBlank();
+    const blockNode = { type: 'code_block', lang: '', lines: [codeText] };
+    parentNode.children.push(blockNode);
+    // consume following indented/blank lines
+    return consumeIndentedCode(sourceLines, lineIdx + 1, openStack, blockNode) - 1;
+  };
+  // Try a fenced code block starting this line. Returns the scan line
+  // just past the block, or null when this line is not a fence. The
+  // block's content ends with a newline (CommonMark: the text between
+  // fences, lines joined).
+  const tryFencedCode = (text, col, lineIdx) => {
+    let fenceInfo = matchFence(text, col);
+    if (!fenceInfo) return null;
+    const parentNode = topNode();
+    markLooseAfterBlank();
+    const blockNode = { type: 'code_block', lang: fenceInfo.lang, fenced: true, fenceCh: fenceInfo.ch, fenceLen: fenceInfo.len, lines: [] };
+    parentNode.children.push(blockNode);
+    closeParagraph();
+    return consumeFencedCode(sourceLines, lineIdx + 1, openStack, fenceInfo, text, col, blockNode) - 1;
+  };
+  // Try a blockquote starting this line (a '>' marker at indent < 4).
+  // Returns 'reprocess' when a blockquote started (the marker is
+  // stripped by the next iteration's container matching, so the same
+  // line is re-processed at the new depth), or null otherwise.
+  const tryBlockquote = (text) => {
+    let scanPos = 0;
+    while (scanPos < text.length && (text.charCodeAt(scanPos) === 32 || text.charCodeAt(scanPos) === 9)) scanPos += 1;
+    if (scanPos >= text.length || text.charCodeAt(scanPos) !== 62 || scanPos >= 4) return null;
+    const parentNode = topNode();
+    markLooseAfterBlank();
+    closeParagraph();
+    const blockNode = { type: 'blockquote', children: [] };
+    parentNode.children.push(blockNode);
+    openStack.push(blockNode);
+    return 'reprocess';
+  };
+
   for (let lineNo = 0; lineNo < sourceLines.length; lineNo++) {
     const raw = sourceLines[lineNo];
     const prevWasLazy = prevLazy;
@@ -4143,40 +4191,23 @@ function parseBlocks(sourceLines, linkDefs, endsWithNewline) {
     if (trySetextHeading(lineText, textCol)) continue;
 
     // ---- indented code (paragraph has priority when one is open) ----
-    if (!activePara) {
-      const indent = indentOf(lineText, textCol);
-      if (indent >= 4) {
-        const codeText = stripIndent(lineText, textCol, 4);
-        // An indented code block starts. If the previous sibling is a
-        // paragraph, the code is a continuation of it (marked: an
-        // indented code block cannot interrupt a paragraph). Since
-        // activePara is null here, no paragraph is open -- but a paragraph
-        // may have been closed by a blank line; only a paragraph that is
-        // STILL open blocks. So start the code block.
-        const parentNode = topNode();
-        markLooseAfterBlank();
-        const blockNode = { type: 'code_block', lang: '', lines: [codeText] };
-        parentNode.children.push(blockNode);
-        // consume following indented/blank lines
-        lineNo = consumeIndentedCode(sourceLines, lineNo + 1, openStack, blockNode) - 1;
+    {
+      let codeEnd = tryIndentedCode(lineText, textCol, lineNo);
+      if (codeEnd !== null) {
+        lineNo = codeEnd;
         prevBlank = false;
         continue;
       }
     }
 
     // ---- fenced code ----
-    const fenceInfo = matchFence(lineText, textCol);
-    if (fenceInfo) {
-      const parentNode = topNode();
-      markLooseAfterBlank();
-      const blockNode = { type: 'code_block', lang: fenceInfo.lang, fenced: true, fenceCh: fenceInfo.ch, fenceLen: fenceInfo.len, lines: [] };
-      parentNode.children.push(blockNode);
-      closeParagraph();
-      // trailing newline of a fenced block: the block's content ends with
-      // a newline (CommonMark: the text between fences, lines joined)
-      lineNo = consumeFencedCode(sourceLines, lineNo + 1, openStack, fenceInfo, lineText, textCol, blockNode) - 1;
-      prevBlank = false;
-      continue;
+    {
+      let fenceEnd = tryFencedCode(lineText, textCol, lineNo);
+      if (fenceEnd !== null) {
+        lineNo = fenceEnd;
+        prevBlank = false;
+        continue;
+      }
     }
 
     // ---- ATX heading ----
@@ -4231,15 +4262,7 @@ function parseBlocks(sourceLines, linkDefs, endsWithNewline) {
 
     // ---- blockquote ----
     {
-      let scanPos = 0;
-      while (scanPos < lineText.length && (lineText.charCodeAt(scanPos) === 32 || lineText.charCodeAt(scanPos) === 9)) scanPos++;
-      if (scanPos < lineText.length && lineText.charCodeAt(scanPos) === 62 && scanPos - 0 < 4) {
-        const parentNode = topNode();
-        markLooseAfterBlank();
-        closeParagraph();
-        const blockNode = { type: 'blockquote', children: [] };
-        parentNode.children.push(blockNode);
-        openStack.push(blockNode);
+      if (tryBlockquote(lineText) === 'reprocess') {
         // the marker is stripped by the next iteration's container
         // matching (the same line is re-processed at the new depth)
         lineNo--;
