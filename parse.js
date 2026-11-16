@@ -1429,33 +1429,50 @@ function skipTagWs(str, pos, len) {
 // Scan a quoted attribute value starting at str[pos] (the quote char).
 // Returns the index just past the closing quote, or -1 when unterminated.
 function scanQuotedValue(str, pos, len, quote) {
-  let end = str.indexOf(String.fromCharCode(quote), pos + 1);
-  if (end === -1 || end >= len) return -1;
-  return end + 1;
+  let k = pos + 1;
+  while (k < len) {
+    if (str.charCodeAt(k) === quote) return k + 1;
+    k += 1;
+  }
+  return -1;
 }
 // Scan an unquoted attribute value starting at str[pos]. Returns the
 // index just past the value, or -1 when the value starts with a
 // forbidden char, contains one, or runs off the end.
 function scanUnquotedValue(str, pos, len) {
-  let m = /[ \t\n>\/"'=<>`]/.exec(str.slice(pos, len));
-  let end = m ? pos + m.index : len;
-  if (end >= len) return -1;
-  let code = str.charCodeAt(end);
-  if (code === 34 || code === 39 || code === 61 || code === 60 || code === 96) return -1;
-  if (end === pos && code === 62) return -1; // a value may not start with '>'
-  return end;
+  let k = pos;
+  while (k < len) {
+    let c = str.charCodeAt(k);
+    // a value ends at whitespace, '>', or a forbidden char
+    if (c === 32 || c === 9 || c === 10) break;
+    if (c === 62 || c === 47 || c === 34 || c === 39 || c === 61 || c === 60 || c === 96) break;
+    k += 1;
+  }
+  if (k >= len) return -1;
+  if (k === pos && str.charCodeAt(k) === 62) return -1; // a value may not start with '>'
+  let stopCode = str.charCodeAt(k);
+  if (stopCode === 34 || stopCode === 39 || stopCode === 61 || stopCode === 60 || stopCode === 96) return -1;
+  return k;
 }
 
 // Scan one attribute name starting at str[pos] (a letter, '_' or ':').
 // Returns the index just past the name, or -1 when invalid.
 function scanAttrName(str, pos, len) {
-  if (pos >= len || !/[A-Za-z_:]/.test(str[pos])) return -1;
+  if (pos >= len) return -1;
+  let first = str.charCodeAt(pos);
+  let isStart = (first >= 65 && first <= 90) || (first >= 97 && first <= 122) || first === 95 || first === 58;
+  if (!isStart) return -1;
   let p = pos + 1;
-  while (p < len && /[A-Za-z0-9_.:-]/.test(str[p])) p += 1;
+  while (p < len) {
+    let c = str.charCodeAt(p);
+    let isCont = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 46 || c === 58 || c === 45;
+    if (!isCont) break;
+    p += 1;
+  }
   return p;
 }
-// Scan one attribute value starting at str[pos] (after '=').
-// Returns the index just past the value, or -1 when invalid.
+// Scan one attribute value starting at str[pos] (after '='). Returns
+// the index just past the value, or -1 when invalid.
 function scanAttrValue(str, pos, len) {
   let p = skipTagWs(str, pos, len);
   if (p >= len) return -1;
@@ -1466,16 +1483,17 @@ function scanAttrValue(str, pos, len) {
     // after a quoted value, whitespace, '/' or '>' must follow
     if (after < len) {
       let nextCode = str.charCodeAt(after);
-      if (nextCode !== 32 && nextCode !== 9 && nextCode !== 10 && nextCode !== 62 && nextCode !== 47) return -1;
+      let okAfter = nextCode === 32 || nextCode === 9 || nextCode === 10 || nextCode === 62 || nextCode === 47;
+      if (!okAfter) return -1;
     }
     return after;
   }
   return scanUnquotedValue(str, p, len);
 }
 
-// Scan tag attributes starting at cursor (after the tag name). Returns the
-// index just past the closing '>' or '/>', or -1 when invalid. The scan
-// is a loop over attributes: each iteration consumes one attribute
+// Scan tag attributes starting at cursor (after the tag name). Returns
+// the index just past the closing '>' or '/>', or -1 when invalid. The
+// scan is a loop over attributes: each iteration consumes one attribute
 // (name, optional '=' + value) and the whitespace around it.
 function scanTagAttrs(str, cursor, len) {
   let pos = cursor;
@@ -1501,15 +1519,19 @@ function scanTagAttrs(str, cursor, len) {
 // (e.g. '?>'), skipping the first `from` chars. Returns {html, next}
 // or null when the terminator is missing.
 function scanSpecialForm(str, start, from, end) {
-  let endIdx = str.indexOf(end, start + from);
-  if (endIdx === -1) return null;
-  return { html: str.slice(start, endIdx + end.length), next: endIdx + end.length };
+  let termAt = str.indexOf(end, start + from);
+  if (termAt === -1) return null;
+  let after = termAt + end.length;
+  return { html: str.slice(start, after), next: after };
 }
 // Scan a declaration <!A ...> from `start` (the '<'). The char after
 // '!' must be a letter. Returns {html, next} or null.
 function scanDeclaration(str, start, len) {
   let cursor = start + 2;
-  if (cursor >= len || !/[A-Za-z]/.test(str[cursor])) return null;
+  if (cursor >= len) return null;
+  let first = str.charCodeAt(cursor);
+  let isLetter = (first >= 65 && first <= 90) || (first >= 97 && first <= 122);
+  if (!isLetter) return null;
   let end = str.indexOf('>', cursor);
   if (end === -1 || end >= len) return null;
   return { html: str.slice(start, end + 1), next: end + 1 };
@@ -1522,7 +1544,10 @@ function scanTagNameAndClose(str, start, len) {
   let cursor = start + 1;
   let isClosing = false;
   if (cursor < len && str.charCodeAt(cursor) === 47) { isClosing = true; cursor += 1; } // '/'
-  if (cursor >= len || !/[A-Za-z]/.test(str[cursor])) return null;
+  if (cursor >= len) return null;
+  let first = str.charCodeAt(cursor);
+  let isLetter = (first >= 65 && first <= 90) || (first >= 97 && first <= 122);
+  if (!isLetter) return null;
   let name = htmlTagName(str, cursor);
   return { name, end: name.end, isClosing };
 }
@@ -1540,7 +1565,8 @@ function scanOpenCloseTag(str, start, len) {
   // the tag name must be whitespace, '/' or '>' (an attribute must be
   // preceded by whitespace); e.g. <m:abc> is not a tag.
   let afterName = str.charCodeAt(cursor);
-  if (afterName !== 32 && afterName !== 9 && afterName !== 10 && afterName !== 62 && afterName !== 47) return null;
+  let okAfterName = afterName === 32 || afterName === 9 || afterName === 10 || afterName === 62 || afterName === 47;
+  if (!okAfterName) return null;
   let tagEnd = scanTagAttrs(str, cursor, len);
   if (tagEnd === -1) return null;
   return { html: str.slice(start, tagEnd), next: tagEnd };
