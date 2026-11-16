@@ -3763,6 +3763,109 @@ function parseBlocks(sourceLines, linkDefs, endsWithNewline) {
     }
   };
 
+  // Start a simple block (an ATX heading or a thematic break): mark
+  // the list loose if a blank line preceded it, close any open
+  // paragraph, and push the node under the current parent.
+  const startSimpleBlock = (node) => {
+    const parentNode = topNode();
+    markLooseAfterBlank();
+    closeParagraph();
+    parentNode.children.push(node);
+    prevBlank = false;
+  };
+  // Handle a blank line: close any open paragraph and remember the
+  // blank for the loose-list and empty-item rules. Returns true when
+  // the line was a blank line (a tab-only line inside a table
+  // paragraph is an empty table row instead, and returns false).
+  const handleBlankLine = (rawLine, text) => {
+    // marked's table regex does not treat a tab-only line as blank
+    // (its blank-line exclusion is ` *\n`, spaces only), so a tab
+    // line inside a table is an empty row. If the open paragraph is
+    // a table (header + delimiter), keep the tab line as one of its
+    // lines instead of closing the paragraph.
+    if (activePara && text.indexOf('\t') !== -1 && activePara.lines.length >= 2 && parseTableDelimiter(activePara.lines[1])) {
+      activePara.lines.push(text);
+      prevBlank = false;
+      return true;
+    }
+    // blank line: close any open paragraph; it does not start a block
+    // (any open blockquote/list stays open for later lines)
+    // Rule: a blank line inside a blockquote followed by lines that
+    // continue the quote does NOT end the quote. A blank line OUTSIDE
+    // the quote (only the quote is open, no inner blocks) DOES end it
+    // -- but the quote remains open for lazy continuation lines, so
+    // closing happens only when a non-blank line that does not match
+    // the quote follows. In marked, after the quote's LAST inner
+    // block ends, a blank line means the quote itself is also closed
+    // (it is the last open block); here we keep it open, which matches
+    // marked when later lines re-open it via the quote marker.
+    // A blank line inside a LIST ITEM: remember it, so a later item
+    // knows the list is loose (and empty-item rules apply).
+    if (activePara) {
+      activePara.endsWithBlank = true;
+      const topBlock = topNode();
+      if (topBlock.type === 'item') topBlock.endsWithBlank = true;
+    }
+    closeParagraph();
+    prevBlank = true;
+    prevBlankTop = topNode().type;
+    prevBlankQuoted = rawLine.indexOf('>') !== -1;
+    return true;
+  };
+  // Try a setext underline for an open paragraph: the WHOLE paragraph
+  // (all its lines) becomes the heading; leading whitespace at the
+  // start of the text and trailing whitespace at the end are stripped.
+  // Returns true when the paragraph became a heading. EXCEPTION: when
+  // the open paragraph is a table (header + delimiter already present),
+  // a setext underline is a table ROW, not a heading -- marked's
+  // table-body regex does not exclude setext underlines (doc-26:
+  // '=========' right after a table row is a row).
+  const trySetextHeading = (text, col) => {
+    if (!activePara) return false;
+    const setextLevel = matchSetext(text, col);
+    if (setextLevel <= 0) return false;
+    if (tryTable(activePara.lines)) {
+      activePara.lines.push(text);
+      prevBlank = false;
+      return true;
+    }
+    const paraParent = activeParaParent;
+    const paraNode = activePara;
+    closeParagraph(); // finalises: extracts ref defs, sets para.text
+    const childIdx = paraParent.children.indexOf(paraNode);
+    if (childIdx !== -1 && paraNode.text !== undefined) {
+      paraParent.children[childIdx] = { type: 'heading', level: setextLevel, text: paraNode.text.replace(/^[ \t]+/, '').replace(/[ \t]+$/, '') };
+      prevBlank = false;
+      return true;
+    }
+    // the paragraph was dropped (only ref defs) or became a table:
+    // the underline is not a heading -- fall through and process
+    // it as a fresh block
+    return false;
+  };
+  // Continue or start a paragraph with this line. Inside a list item,
+  // a line indented 4+ columns (after the item indent) loses 4 of them
+  // (the indented-code indent is stripped during the list's outdent);
+  // at top level and in blockquotes the indent is kept as-is.
+  const continueParagraphLine = (text, col) => {
+    const parentNode = topNode();
+    if (activePara) {
+      let contText = text;
+      if (parentNode.type === 'item' && indentOf(contText, col) >= 4) {
+        contText = stripIndent(contText, col, 4);
+      }
+      activePara.lines.push(contText);
+    } else {
+      markLooseAfterBlank();
+      const blockNode = { type: 'paragraph', lines: [text] };
+      parentNode.children.push(blockNode);
+      activePara = blockNode;
+      activeParaParent = parentNode;
+      activeParaDepth = openStack.length;
+    }
+    prevBlank = false;
+  };
+
   for (let lineNo = 0; lineNo < sourceLines.length; lineNo++) {
     const raw = sourceLines[lineNo];
     const prevWasLazy = prevLazy;
@@ -3840,70 +3943,12 @@ function parseBlocks(sourceLines, linkDefs, endsWithNewline) {
     let itemStart = false, itemMarker = null;
     let done = false;
     if (blankText) {
-      // marked's table regex does not treat a tab-only line as blank
-      // (its blank-line exclusion is ` *\n`, spaces only), so a tab
-      // line inside a table is an empty row. If the open paragraph is
-      // a table (header + delimiter), keep the tab line as one of its
-      // lines instead of closing the paragraph.
-      if (activePara && lineText.indexOf('\t') !== -1 && activePara.lines.length >= 2 && parseTableDelimiter(activePara.lines[1])) {
-        activePara.lines.push(lineText);
-        prevBlank = false;
-        continue;
-      }
-      // blank line: close any open paragraph; it does not start a block
-      // (any open blockquote/list stays open for later lines)
-      // Rule: a blank line inside a blockquote followed by lines that
-      // continue the quote does NOT end the quote. A blank line OUTSIDE
-      // the quote (only the quote is open, no inner blocks) DOES end it
-      // -- but the quote remains open for lazy continuation lines, so
-      // closing happens only when a non-blank line that does not match
-      // the quote follows. In marked, after the quote's LAST inner
-      // block ends, a blank line means the quote itself is also closed
-      // (it is the last open block); here we keep it open, which matches
-      // marked when later lines re-open it via the quote marker.
-      // A blank line inside a LIST ITEM: remember it, so a later item
-      // knows the list is loose (and empty-item rules apply).
-      if (activePara) {
-        activePara.endsWithBlank = true;
-        const topBlock = topNode();
-        if (topBlock.type === 'item') topBlock.endsWithBlank = true;
-      }
-      closeParagraph();
-      prevBlank = true;
-      prevBlankTop = topNode().type;
-      prevBlankQuoted = raw.indexOf('>') !== -1;
+      handleBlankLine(raw, lineText);
       continue;
     }
 
-    // setext underline for an open paragraph: the WHOLE paragraph
-    // (all its lines) becomes the heading; leading whitespace at the
-    // start of the text and trailing whitespace at the end are stripped.
-    // EXCEPTION: when the open paragraph is a table (header + delimiter
-    // already present), a setext underline is a table ROW, not a heading
-    // -- marked's table-body regex does not exclude setext underlines
-    // (doc-26: '=========' right after a table row is a row).
-    if (activePara) {
-      const setextLevel = matchSetext(lineText, textCol);
-      if (setextLevel > 0) {
-        if (tryTable(activePara.lines)) {
-          activePara.lines.push(lineText);
-          prevBlank = false;
-          continue;
-        }
-        const paraParent = activeParaParent;
-        const paraNode = activePara;
-        closeParagraph(); // finalises: extracts ref defs, sets para.text
-        const childIdx = paraParent.children.indexOf(paraNode);
-        if (childIdx !== -1 && paraNode.text !== undefined) {
-          paraParent.children[childIdx] = { type: 'heading', level: setextLevel, text: paraNode.text.replace(/^[ \t]+/, '').replace(/[ \t]+$/, '') };
-          prevBlank = false;
-          continue;
-        }
-        // the paragraph was dropped (only ref defs) or became a table:
-        // the underline is not a heading -- fall through and process
-        // it as a fresh block
-      }
-    }
+    // setext underline for an open paragraph
+    if (trySetextHeading(lineText, textCol)) continue;
 
     // ---- indented code (paragraph has priority when one is open) ----
     if (!activePara) {
@@ -3945,21 +3990,13 @@ function parseBlocks(sourceLines, linkDefs, endsWithNewline) {
     // ---- ATX heading ----
     const atxHead = matchATX(lineText, textCol);
     if (atxHead) {
-      const parentNode = topNode();
-      markLooseAfterBlank();
-      closeParagraph();
-      parentNode.children.push({ type: 'heading', level: atxHead.level, text: atxHead.text });
-      prevBlank = false;
+      startSimpleBlock({ type: 'heading', level: atxHead.level, text: atxHead.text });
       continue;
     }
 
     // ---- thematic break ----
     if (matchHR(lineText, textCol)) {
-      const parentNode = topNode();
-      markLooseAfterBlank();
-      closeParagraph();
-      parentNode.children.push({ type: 'hr' });
-      prevBlank = false;
+      startSimpleBlock({ type: 'hr' });
       continue;
     }
 
@@ -4117,26 +4154,7 @@ function parseBlocks(sourceLines, linkDefs, endsWithNewline) {
 
     // ---- paragraph continuation / new paragraph ----
     {
-      const parentNode = topNode();
-      if (activePara) {
-        // continuation line. Inside a list item, a line indented 4+
-        // columns (after the item indent) loses 4 of them (the
-        // indented-code indent is stripped during the list's outdent);
-        // at top level and in blockquotes the indent is kept as-is.
-        let contText = lineText;
-        if (parentNode.type === 'item' && indentOf(contText, textCol) >= 4) {
-          contText = stripIndent(contText, textCol, 4);
-        }
-        activePara.lines.push(contText);
-      } else {
-        markLooseAfterBlank();
-        const blockNode = { type: 'paragraph', lines: [lineText] };
-        parentNode.children.push(blockNode);
-        activePara = blockNode;
-        activeParaParent = parentNode;
-        activeParaDepth = openStack.length;
-      }
-      prevBlank = false;
+      continueParagraphLine(lineText, textCol);
       continue;
     }
   }
