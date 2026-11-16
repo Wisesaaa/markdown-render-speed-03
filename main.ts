@@ -10,25 +10,33 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from './parse.js';
 
-// Resolve the input/output directories, honouring the MAKEFUN_*
-// environment overrides and falling back to the container paths.
-function dirs() {
-  let inputDir = process.env.MAKEFUN_INPUT_DIR;
-  if (inputDir === undefined) inputDir = '/input';
-  let outputDir = process.env.MAKEFUN_OUTPUT_DIR;
-  if (outputDir === undefined) outputDir = '/output';
-  return { inputDir, outputDir };
+// Resolve one directory: the MAKEFUN_* environment override wins,
+// otherwise the container path.
+function resolveDir(envName, fallback) {
+  let value = process.env[envName];
+  return value === undefined ? fallback : value;
+}
+
+function loadCases(inputDir) {
+  let raw = readFileSync(join(inputDir, 'cases.json'), 'utf8');
+  return JSON.parse(raw);
+}
+
+function renderCases(cases) {
+  return cases.map((entry) => parse(entry.markdown));
+}
+
+function saveHtml(outputDir, html) {
+  mkdirSync(outputDir, { recursive: true });
+  writeFileSync(join(outputDir, 'html.json'), JSON.stringify(html));
 }
 
 function main() {
-  let { inputDir, outputDir } = dirs();
-  const cases = JSON.parse(readFileSync(join(inputDir, 'cases.json'), 'utf8'));
-  let html = new Array(cases.length);
-  for (let idx = 0; idx < cases.length; idx += 1) {
-    html[idx] = parse(cases[idx].markdown);
-  }
-  mkdirSync(outputDir, { recursive: true });
-  writeFileSync(join(outputDir, 'html.json'), JSON.stringify(html));
+  let inputDir = resolveDir('MAKEFUN_INPUT_DIR', '/input');
+  let outputDir = resolveDir('MAKEFUN_OUTPUT_DIR', '/output');
+  let cases = loadCases(inputDir);
+  let html = renderCases(cases);
+  saveHtml(outputDir, html);
 }
 
 main();
