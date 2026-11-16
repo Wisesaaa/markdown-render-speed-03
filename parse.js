@@ -190,50 +190,60 @@ const SPECIAL = new Uint8Array(128);
 for (const ch of '`*_~[![<&\\\n') SPECIAL[ch.charCodeAt(0)] = 1;
 
 // Flanking helpers (CommonMark): char before/after a delimiter run.
+// Flanking helpers (CommonMark): whether a delimiter run is
+// left-flanking and/or right-flanking, from the chars around it.
+// `before`/`after` are single chars ('' at the edges of the text).
 function flanking(before, after) {
-  // before/after are single chars (or '' at the edges).
-  let bSpace = before === '' || isUnicodeSpace(before);
-  let aSpace = after === '' || isUnicodeSpace(after);
-  let bPunct = before !== '' && isUnicodePunct(before);
-  let aPunct = after !== '' && isUnicodePunct(after);
-  let left = !aSpace && (!aPunct || bSpace || bPunct);
-  let right = !bSpace && (!bPunct || aSpace || aPunct);
-  return [left, right];
+  let beforeIsSpace = before === '' || isUnicodeSpace(before);
+  let afterIsSpace = after === '' || isUnicodeSpace(after);
+  let beforeIsPunct = before !== '' && isUnicodePunct(before);
+  let afterIsPunct = after !== '' && isUnicodePunct(after);
+  let leftFlanking = !afterIsSpace && (!afterIsPunct || beforeIsSpace || beforeIsPunct);
+  let rightFlanking = !beforeIsSpace && (!beforeIsPunct || afterIsSpace || afterIsPunct);
+  return [leftFlanking, rightFlanking];
 }
 
 // Delimiter record: {ch, len, open, close, idx} where idx is the chunk index
 // in the output array holding this run's literal text.
 
-// Category of the char before a delimiter: 'punct', 'space', 'word',
-// or 'edge' (start of text). An empty char is an edge, not a space.
-function prevCategory(prev) {
-  if (prev === '') return 'edge';
-  if (isUnicodePunct(prev)) return 'punct';
-  if (isSpace(prev.charCodeAt(0))) return 'space';
+// Classify one neighbour char of a delimiter run: 'punct', 'space',
+// 'word', or 'edge' (start of text for the char before, which an empty
+// char means; the char after never yields 'edge' -- an empty char
+// there counts as a space).
+function classifyNeighbour(ch, isBefore) {
+  if (ch === '') return isBefore ? 'edge' : 'space';
+  if (isUnicodePunct(ch)) return 'punct';
+  if (isSpace(ch.charCodeAt(0))) return 'space';
   return 'word';
 }
-// Category of the char after a delimiter: 'punct', 'space', or 'word'.
-// An empty char (end of text) counts as a space.
+// Category of the char before a delimiter.
+function prevCategory(prev) {
+  return classifyNeighbour(prev, true);
+}
+// Category of the char after a delimiter.
 function nextCategory(next) {
-  if (next === '') return 'space';
-  if (isUnicodePunct(next)) return 'punct';
-  if (isSpace(next.charCodeAt(0))) return 'space';
-  return 'word';
+  return classifyNeighbour(next, false);
 }
 
-// Category of a delimiter run from its neighbours, following marked's
+// The delimiter group of a run from its neighbours, following marked's
 // emStrongRDelimAst/Und groups. Returns 'open' (groups 3-4), 'close'
-// (groups 1-2), 'both' (groups 5-6), or '' (no group).
+// (groups 1-2), 'both' (groups 5-6), or '' (no group). The groups are
+// a table over the (prev, next) category pair.
+const DELIM_GROUP_TABLE = {
+  'punct space': 'close',
+  'word punct': 'close',
+  'word space': 'close',
+  'punct word': 'open',
+  'space word': 'open',
+  'space punct': 'open',
+  'punct punct': 'both',
+  'word word': 'both',
+};
 function delimGroup(prev, next) {
   let p = prevCategory(prev);
   let n = nextCategory(next);
-  if (p === 'punct' && n === 'space') return 'close';
-  if (p === 'word' && (n === 'punct' || n === 'space')) return 'close';
-  if ((p === 'punct' || p === 'space') && n === 'word') return 'open';
-  if (p === 'space' && n === 'punct') return 'open';
-  if (p === 'punct' && n === 'punct') return 'both';
-  if (p === 'word' && n === 'word') return 'both';
-  return '';
+  let group = DELIM_GROUP_TABLE[p + ' ' + n];
+  return group === undefined ? '' : group;
 }
 
 // For each '*'/'_' opener, run marked's emStrong m-balance forward
@@ -244,18 +254,20 @@ function delimGroup(prev, next) {
 // not; but `*foo **bar**baz*` never closes because the inner
 // both-flanking ** closer is skipped by the rule of 3).
 function markStrongOpeners(delims) {
-  for (let i = 0; i < delims.length; i += 1) {
-    let opener = delims[i];
+  let idx = 0;
+  while (idx < delims.length) {
+    let opener = delims[idx];
+    idx += 1;
     if (!opener || !opener.open) continue;
     if (opener.ch === '~') continue;
     let ch = opener.ch;
-    let y = opener.len;
-    let k = opener.len;
+    let totalLen = opener.len;
+    let k = totalLen;
     while (k >= 1) {
       // scanCloses answers as [res, skipped]: res 0 never closes,
       // 1 closes as em, 2 closes as strong; skipped means a
       // both-flanking closer was passed over by the rule of 3.
-      let verdict = scanCloses(delims, i, ch, k, y);
+      let verdict = scanCloses(delims, idx - 1, ch, k, totalLen);
       let res = verdict[0];
       let skipped = verdict[1];
       if (res === 1) break;
@@ -280,61 +292,65 @@ function markStrongOpeners(delims) {
 // Is a len-1 opener nested inside a len>=2 opener (e.g. `*...*` inside
 // `**...**`)? Such an opener cannot close at a len>=2 closer: that
 // closer belongs to the enclosing strong, so its scope ends before it.
+// Walk backwards from i: the first len>=2 run of the same char decides
+// (an opener means nested, a closer means not).
 function openerInsideStrong(delims, i, ch) {
   let s = i - 1;
   while (s >= 0) {
     let od = delims[s];
-    if (od && od.ch === ch && od.open && od.len >= 2) return true;
-    if (od && od.ch === ch && od.close && od.len >= 2) return false;
+    if (od && od.ch === ch && od.len >= 2) {
+      if (od.open) return true;
+      if (od.close) return false;
+    }
     s -= 1;
   }
   return false;
 }
 
 // Run the m-balance from delimiter index i with opener run length k
-// and total run length y. Returns {res: 0 (never closes), 1 (em),
-// 2 (strong), skipped: whether a both-flanking closer was skipped
-// by the rule of 3}.
+// and total run length y. Returns [res, skipped]: res 0 (never closes),
+// 1 (closes as em), 2 (closes as strong); skipped means a both-flanking
+// closer was passed over by the rule of 3. The balance starts at k
+// and each closer subtracts its length; an open-only run adds its
+// length (it extends the run that must be closed).
 function scanCloses(delims, i, ch, k, y) {
-  let m = k;
-  let f = 0;
+  let balance = k;
+  let skippedLen = 0;
   let opener = delims[i];
   let prev = opener.prev || '';
   let next = opener.next || '';
-  let h = prev === '*' || prev === '_' || isUnicodePunct(prev);
-  let R = prev !== '' && prev.trim() !== '' && (next !== '' || (ch === '*' && !h));
-  // A len-1 opener nested inside a len>=2 opener (e.g. `*...*` inside
-  // `**...**`) cannot close at a len>=2 closer: that closer belongs
-  // to the enclosing strong. Its scope ends before such a closer.
+  let prevIsDelimOrPunct = prev === '*' || prev === '_' || isUnicodePunct(prev);
+  let ruleOfThreeApplies = prev !== '' && prev.trim() !== '' && (next !== '' || (ch === '*' && !prevIsDelimOrPunct));
+  // A len>=2 closer that is not skipped belongs to the enclosing
+  // strong when this opener is nested inside one; stop the scan
+  // there instead of letting it close the nested opener.
   let insideStrong = opener.len === 1 && openerInsideStrong(delims, i, ch);
-  let t = i + 1;
-  while (t < delims.length) {
-    let d = delims[t];
-    t += 1;
-    if (!d || d.len === 0 || d.ch !== ch) continue;
-    let b = d.len;
-    let g = delimGroup(d.prev || '', d.next || '');
-    if (g === '') continue;
-    if (g === 'open') {
-      if (!d.open) continue;
-      m += b;
+  let scanIdx = i + 1;
+  while (scanIdx < delims.length) {
+    let cand = delims[scanIdx];
+    scanIdx += 1;
+    if (!cand || cand.len === 0 || cand.ch !== ch) continue;
+    let runLen = cand.len;
+    let group = delimGroup(cand.prev || '', cand.next || '');
+    if (group === '') continue;
+    if (group === 'open') {
+      if (!cand.open) continue;
+      balance += runLen;
       continue;
     }
-    if (!d.close) continue;
-    if (g === 'both' || R) {
-      if (y % 3 !== 0 && (y + b) % 3 === 0) { f += b; continue; }
+    if (!cand.close) continue;
+    if (group === 'both' || ruleOfThreeApplies) {
+      if (y % 3 !== 0 && (y + runLen) % 3 === 0) { skippedLen += runLen; continue; }
     }
-    // A len>=2 closer that is not skipped belongs to the enclosing
-    // strong when this opener is nested inside one; stop the scan
-    // there instead of letting it close the nested opener.
-    if (insideStrong && b >= 2) break;
-    m -= b;
-    if (m > 0) continue;
-    let b2 = b + m + f < b ? b + m + f : b;
+    if (insideStrong && runLen >= 2) break;
+    balance -= runLen;
+    if (balance > 0) continue;
+    let effective = balance + skippedLen + runLen;
+    let b2 = effective < runLen ? effective : runLen;
     let use = b2 < k ? b2 : k;
-    return [use % 2 === 0 ? 2 : 1, f > 0];
+    return [use % 2 === 0 ? 2 : 1, skippedLen > 0];
   }
-  return [0, f > 0];
+  return [0, skippedLen > 0];
 }
 
 const EMPHASIS_CHARS = ['*', '_', '~'];
@@ -347,13 +363,19 @@ function resetEmphasisFloors(floor) {
 // have the SAME length, and it must be 1 or 2 (a longer run leaves a
 // '~' adjacent to the delimiter, failing the lookahead).
 function tildeMatchOk(candLen, closerLen) {
-  return candLen === closerLen && candLen <= 2;
+  if (candLen !== closerLen) return false;
+  return candLen <= 2;
 }
-// Does the rule of 3 allow this opener/closer pair?
+// Does the rule of 3 allow this opener/closer pair? When neither run
+// is both-flanking, the rule does not apply. Otherwise the pair is
+// allowed unless the sum of the lengths is divisible by 3 while
+// neither length alone is.
 function ruleOfThreeOk(cand, closer) {
   let oddMatch = (cand.open && cand.close) || (closer.open && closer.close);
   if (!oddMatch) return true;
-  return (cand.len + closer.len) % 3 !== 0 || (cand.len % 3 === 0 && closer.len % 3 === 0);
+  let sumDivisible = (cand.len + closer.len) % 3 === 0;
+  let bothDivisible = cand.len % 3 === 0 && closer.len % 3 === 0;
+  return !sumDivisible || bothDivisible;
 }
 
 function findEmphasisOpener(delims, closeAt, closer, floor, isSuppressed) {
@@ -363,42 +385,44 @@ function findEmphasisOpener(delims, closeAt, closer, floor, isSuppressed) {
   let seen = false;
   while (at > low) {
     let cand = delims[at];
-    if (cand && cand.ch === ch && cand.open) {
-      seen = true;
-      // '~' (strikethrough): the two runs must have the SAME length,
-      // and it must be 1 or 2. Otherwise this opener cannot match.
-      if (ch === '~' && !tildeMatchOk(cand.len, closer.len)) { at -= 1; continue; }
-      if (ruleOfThreeOk(cand, closer)) {
-        // A lone close-only run must not steal one delimiter from a
-        // '**' opener that the m-balance says closes as strong.
-        if (cand.len === 2 && closer.len === 1 && !closer.open && !cand.close && cand.expectsStrong) { at -= 1; continue; }
-        // The m-balance says this opener never closes (no k in
-        // 1..len reaches m <= 0), so it must stay literal.
-        if (cand.closes === false) { at -= 1; continue; }
-        // Rule A / Rule B: this match is suppressed by a phantom
-        // code span or an unformed-link region -- keep searching
-        // backwards for another opener for this closer.
-        if (isSuppressed(cand, closer)) { at -= 1; continue; }
-        return [at, true];
-      }
-    }
     at -= 1;
+    if (!cand || cand.ch !== ch || !cand.open) continue;
+    seen = true;
+    // '~' (strikethrough): the two runs must have the SAME length,
+    // and it must be 1 or 2. Otherwise this opener cannot match.
+    if (ch === '~' && !tildeMatchOk(cand.len, closer.len)) continue;
+    if (!ruleOfThreeOk(cand, closer)) continue;
+    // A lone close-only run must not steal one delimiter from a
+    // '**' opener that the m-balance says closes as strong.
+    if (cand.len === 2 && closer.len === 1 && !closer.open && !cand.close && cand.expectsStrong) continue;
+    // The m-balance says this opener never closes (no k in
+    // 1..len reaches m <= 0), so it must stay literal.
+    if (cand.closes === false) continue;
+    // Rule A / Rule B: this match is suppressed by a phantom
+    // code span or an unformed-link region -- keep searching
+    // backwards for another opener for this closer.
+    if (isSuppressed(cand, closer)) continue;
+    return [at + 1, true];
   }
   return [-1, seen];
 }
 
+// Apply one emphasis match to the output chunks: wrap the opener's
+// and closer's chunks with the tag, consuming `take` delimiters from
+// each. Returns the closer's old leftover length (used by the
+// inner-skip rule). Chunk layout: an opener's leftover delimiters sit
+// on the LEFT (outer side), its tags after them; a closer's leftover
+// delimiters sit on the RIGHT, its tags before them. A new match
+// consumes the delimiters adjacent to the content, so the new tag goes
+// right after the opener's leftovers / right before the closer's
+// leftovers.
 function applyEmphasisTags(html, openDelim, closeDelim, tagName, take) {
-  // Chunk layout: an opener's leftover delimiters sit on the LEFT
-  // (outer side), its tags after them; a closer's leftover delimiters
-  // sit on the RIGHT, its tags before them. A new match consumes the
-  // delimiters adjacent to the content, so the new tag goes right
-  // after the opener's leftovers / right before the closer's leftovers.
   let openChunk = html[openDelim.idx];
   let openOldLeft = openDelim.len;
   let openLeft = openOldLeft - take;
   let openTail = openChunk.slice(openOldLeft);
   let openLit = openLeft > 0 ? openDelim.ch.repeat(openLeft) : '';
-  html[openDelim.idx] = `${openLit}<${tagName}>${openTail}`;
+  html[openDelim.idx] = openLit + '<' + tagName + '>' + openTail;
   openDelim.len = openLeft;
   let closeChunk = html[closeDelim.idx];
   let closeOldLeft = closeDelim.len;
@@ -408,11 +432,11 @@ function applyEmphasisTags(html, openDelim, closeDelim, tagName, take) {
   // (marked's f), the adjusted closer length b exceeds `take`, so the
   // leftover delimiters stay INSIDE the tag (M.slice(2,-2) keeps the
   // first b-take of them as content). Otherwise they go outside.
+  let closeLit = closeLeft > 0 ? closeDelim.ch.repeat(closeLeft) : '';
   if (openDelim.hasInnerSkip && closeLeft > 0) {
-    html[closeDelim.idx] = `${closeHead}${closeDelim.ch.repeat(closeLeft)}</${tagName}>`;
+    html[closeDelim.idx] = closeHead + closeLit + '</' + tagName + '>';
   } else {
-    let closeLit = closeLeft > 0 ? closeDelim.ch.repeat(closeLeft) : '';
-    html[closeDelim.idx] = `${closeHead}</${tagName}>${closeLit}`;
+    html[closeDelim.idx] = closeHead + '</' + tagName + '>' + closeLit;
   }
   closeDelim.len = closeLeft;
   return closeOldLeft;
@@ -421,8 +445,11 @@ function applyEmphasisTags(html, openDelim, closeDelim, tagName, take) {
 // Is `pos` inside one of the phantom code spans? (Rule A)
 function insidePhantomSpan(phantomSpans, pos) {
   if (!phantomSpans) return false;
-  for (let idx = 0; idx < phantomSpans.length; idx += 1) {
-    if (pos >= phantomSpans[idx][0] && pos < phantomSpans[idx][1]) return true;
+  let idx = 0;
+  while (idx < phantomSpans.length) {
+    let span = phantomSpans[idx];
+    if (pos >= span[0] && pos < span[1]) return true;
+    idx += 1;
   }
   return false;
 }
@@ -437,9 +464,13 @@ function emphasisMatchSuppressed(openDelim, closeDelim, text, phantomSpans, supp
   if (insidePhantomSpan(phantomSpans, closePos)) return true;
   if (!suppressedRegions || suppressedRegions.length === 0 || text === undefined) return false;
   let openPos = openDelim.pos + openDelim.len - 1;
-  for (let idx = 0; idx < suppressedRegions.length; idx += 1) {
+  let idx = 0;
+  while (idx < suppressedRegions.length) {
     let region = suppressedRegions[idx];
-    if (openPos >= region[0] && openPos < region[1] && closePos >= region[0] && closePos < region[1]) {
+    idx += 1;
+    let openInside = openPos >= region[0] && openPos < region[1];
+    let closeInside = closePos >= region[0] && closePos < region[1];
+    if (openInside && closeInside) {
       if (hasUncleanCodeSpan(text, openPos + 1, closePos)) return true;
     }
   }
@@ -450,11 +481,12 @@ function emphasisMatchSuppressed(openDelim, closeDelim, text, phantomSpans, supp
 // '~' uses the run length (1 or 2; opener and closer lengths match).
 function emphasisTakeAndTag(openDelim, closeDelim, delimChar) {
   let take = 1;
+  if (delimChar === '~') {
+    take = openDelim.len;
+    return { take, tagName: 'del' };
+  }
   if (openDelim.len >= 2 && closeDelim.len >= 2) take = 2;
-  if (delimChar === '~') take = openDelim.len;
-  let tagName = 'em';
-  if (delimChar === '~') tagName = 'del';
-  else if (take === 2) tagName = 'strong';
+  let tagName = take === 2 ? 'strong' : 'em';
   return { take, tagName };
 }
 // Record a rule-of-3 skip for the nearest enclosing opener: if this
@@ -465,11 +497,11 @@ function recordInnerSkip(delimiters, openIdx, delimChar, floor, closeOldLeft) {
   let scanIdx = openIdx - 1;
   while (scanIdx > floor[delimChar]) {
     let outer = delimiters[scanIdx];
-    if (outer && outer.ch === delimChar && outer.open) {
-      if (outer.len % 3 !== 0 && (outer.len + closeOldLeft) % 3 === 0) outer.hasInnerSkip = true;
-      break;
-    }
     scanIdx -= 1;
+    if (!outer || outer.ch !== delimChar || !outer.open) continue;
+    let sumDivisible = (outer.len + closeOldLeft) % 3 === 0;
+    if (outer.len % 3 !== 0 && sumDivisible) outer.hasInnerSkip = true;
+    break;
   }
 }
 
