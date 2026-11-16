@@ -1028,10 +1028,9 @@ function hasUnderscoreOpener(s, upto) {
   return false;
 }
 
-// Validate an email autolink whose '@' is at s[at]. The local part is
-// scanned back over [A-Za-z0-9._+-] (clamped to `minStart`). Returns
-// {start, end} or null.
-function matchEmailAt(s, at, n, minStart) {
+// Scan the email local part back from `at` over [A-Za-z0-9._+-],
+// clamped to `minStart`. Returns the start index.
+function emailLocalStart(s, at, minStart) {
   let ls = at;
   while (ls > minStart) {
     let c = s.charCodeAt(ls - 1);
@@ -1040,6 +1039,29 @@ function matchEmailAt(s, at, n, minStart) {
     if (!local) break;
     ls -= 1;
   }
+  return ls;
+}
+// Try the email regex without the lookahead at `ls`; accept the longer
+// match only when it ends before a '_' with a '_' opener before the
+// email (marked resolves emphasis first, so its email regex never sees
+// the closer). `allowEnd` accepts a match that runs to the end of the
+// string. Returns the end index or -1.
+function emailLongerEnd(s, ls, n, end, allowEnd) {
+  let m2 = EMAIL_GFM_NOLOOK.exec(s.slice(ls, n));
+  if (!m2) return -1;
+  let end2 = ls + m2[0].length;
+  if (end2 <= end) return -1;
+  if (end2 >= n && !allowEnd) return -1;
+  if (end2 >= n) return end2;
+  if (s.charCodeAt(end2) === 95 && hasUnderscoreOpener(s, ls)) return end2;
+  return -1;
+}
+
+// Validate an email autolink whose '@' is at s[at]. The local part is
+// scanned back over [A-Za-z0-9._+-] (clamped to `minStart`). Returns
+// {start, end} or null.
+function matchEmailAt(s, at, n, minStart) {
+  let ls = emailLocalStart(s, at, minStart);
   if (ls >= at) return null;
   let m = EMAIL_GFM.exec(s.slice(ls, n));
   if (!m) {
@@ -1049,14 +1071,9 @@ function matchEmailAt(s, at, n, minStart) {
     // accept the longer match only if a '_' opener exists before the
     // email -- otherwise marked's regex fails entirely (e.g.
     // `foo@bar.com__` with no opener renders as plain text).
-    let m2 = EMAIL_GFM_NOLOOK.exec(s.slice(ls, n));
-    if (!m2) return null;
-    let end2 = ls + m2[0].length;
-    if (end2 >= n) return { start: ls, end: end2 };
-    if (s.charCodeAt(end2) === 95 && hasUnderscoreOpener(s, ls)) {
-      return { start: ls, end: end2 };
-    }
-    return null;
+    let end2 = emailLongerEnd(s, ls, n, ls, true);
+    if (end2 === -1) return null;
+    return { start: ls, end: end2 };
   }
   let end = ls + m[0].length;
   // The lookahead may have shortened the match (backtracked past a
@@ -1065,13 +1082,8 @@ function matchEmailAt(s, at, n, minStart) {
   // the lookahead and take the longer match when it ends before a '_'
   // with a '_' opener before the email.
   if (end < n && s.charCodeAt(end) === 46) {
-    let m2 = EMAIL_GFM_NOLOOK.exec(s.slice(ls, n));
-    if (m2) {
-      let end2 = ls + m2[0].length;
-      if (end2 > end && end2 < n && s.charCodeAt(end2) === 95 && hasUnderscoreOpener(s, ls)) {
-        return { start: ls, end: end2 };
-      }
-    }
+    let end2 = emailLongerEnd(s, ls, n, end, false);
+    if (end2 !== -1) return { start: ls, end: end2 };
   }
   return { start: ls, end };
 }
@@ -3620,6 +3632,52 @@ function expandLeadingTabs(rem, col) {
 // on a null return, saying which container the line failed to match
 // (a lazy line fails only on a list-item indent; a missing blockquote
 // marker means the line is outside the quote).
+// Match one blockquote container while stripping containers from a line.
+// Returns {pos, col, pad} on a match, 'blank' when the line is blank
+// (blank lines match any container), or null when it fails.
+function stripOneBlockquote(rawLine, pos, col, pad) {
+  let p = pos;
+  let c = col;
+  let sp = 0;
+  while (p < rawLine.length && sp < 3 && rawLine.charCodeAt(p) === 32) { p += 1; c += 1; sp += 1; }
+  if (p < rawLine.length && rawLine.charCodeAt(p) === 62) {
+    p += 1; c += 1;
+    let vgt = pad + (p - pos) - 1;
+    let expanded = expandMarkerWs(rawLine, p, vgt + 1);
+    if (expanded.hasTab) { pad = expanded.exp > 0 ? expanded.exp - 1 : 0; c = expanded.vq; p = expanded.q; }
+    else if (expanded.q > p) { p += 1; c += 1; }
+    return { pos: p, col: c, pad };
+  }
+  if (isBlankStr(rawLine)) return 'blank';
+  return null;
+}
+// Match one list-item container while stripping containers from a line.
+// Returns {pos, col, pad} on a match, 'blank' when the line is blank
+// after the outer containers, or null when it fails.
+function stripOneItem(rawLine, pos, col, pad, relIndent) {
+  // a line that is blank after the outer containers were stripped
+  // (e.g. a lone '>' inside a blockquote) matches the item
+  if (isBlankStr(rawLine.slice(pos))) return 'blank';
+  let adv = matchItemIndent(rawLine, pos, col, pad, relIndent);
+  if (!adv) return null;
+  return { pos: adv.cursor, col: adv.column, pad: adv.padding };
+}
+// Record a container failure in `fail` (when given) and return null.
+function stripFail(fail, reason, pos, col, pad) {
+  if (fail) { fail.reason = reason; fail.pos = pos; fail.col = col; fail.pad = pad; }
+  return null;
+}
+
+// Strip the open containers (stack entries after the document) from a
+// line, for the multi-line consumption in code/HTML blocks. Returns
+// {text, col} or null when the line does not match the containers
+// (a line that does not match is not part of the block). Blank lines
+// match any container (CommonMark). The containers are re-matched
+// independently of the main loop (so `stack` must be the same stack).
+// When `fail` is given, it is set to {reason:'blockquote'|'item'}
+// on a null return, saying which container the line failed to match
+// (a lazy line fails only on a list-item indent; a missing blockquote
+// marker means the line is outside the quote).
 function stripContainersForLine(rawLine, stack, fail) {
   let pos = 0;
   let col = 0;
@@ -3628,41 +3686,28 @@ function stripContainersForLine(rawLine, stack, fail) {
   while (si < stack.length) {
     let cont = stack[si];
     if (cont.type === 'blockquote') {
-      let p = pos;
-      let c = col;
-      let sp = 0;
-      while (p < rawLine.length && sp < 3 && rawLine.charCodeAt(p) === 32) { p += 1; c += 1; sp += 1; }
-      if (p < rawLine.length && rawLine.charCodeAt(p) === 62) {
-        p += 1; c += 1;
-        let vgt = pad + (p - pos) - 1;
-        let expanded = expandMarkerWs(rawLine, p, vgt + 1);
-        if (expanded.hasTab) { pad = expanded.exp > 0 ? expanded.exp - 1 : 0; c = expanded.vq; p = expanded.q; }
-        else if (expanded.q > p) { p += 1; c += 1; }
-        pos = p; col = c;
-        si += 1;
-        continue;
-      }
-      if (isBlankStr(rawLine)) { si += 1; continue; }
-      if (fail) { fail.reason = 'blockquote'; fail.pos = pos; fail.col = col; fail.pad = pad; }
-      return null;
+      let matched = stripOneBlockquote(rawLine, pos, col, pad);
+      if (matched === 'blank') { si += 1; continue; }
+      if (!matched) return stripFail(fail, 'blockquote', pos, col, pad);
+      pos = matched.pos; col = matched.col; pad = matched.pad;
+      si += 1;
+      continue;
     }
     if (cont.type === 'item') {
-      // a line that is blank after the outer containers were stripped
-      // (e.g. a lone '>' inside a blockquote) matches the item
-      if (isBlankStr(rawLine.slice(pos))) { si += 1; continue; }
-      let adv = matchItemIndent(rawLine, pos, col, pad, cont.relIndent);
-      if (!adv) { if (fail) { fail.reason = 'item'; fail.pos = pos; fail.col = col; fail.pad = pad; } return null; }
-      pos = adv.cursor; col = adv.column; pad = adv.padding;
+      let matched = stripOneItem(rawLine, pos, col, pad, cont.relIndent);
+      if (matched === 'blank') { si += 1; continue; }
+      if (!matched) return stripFail(fail, 'item', pos, col, pad);
+      pos = matched.pos; col = matched.col; pad = matched.pad;
       si += 1;
       continue;
     }
     // list: transparent; handled by the item entry below
     let next = stack[si + 1];
     if (next && next.type === 'item') {
-      if (isBlankStr(rawLine.slice(pos))) { si += 2; continue; }
-      let adv = matchItemIndent(rawLine, pos, col, pad, next.relIndent);
-      if (!adv) { if (fail) { fail.reason = 'item'; fail.pos = pos; fail.col = col; fail.pad = pad; } return null; }
-      pos = adv.cursor; col = adv.column; pad = adv.padding;
+      let matched = stripOneItem(rawLine, pos, col, pad, next.relIndent);
+      if (matched === 'blank') { si += 2; continue; }
+      if (!matched) return stripFail(fail, 'item', pos, col, pad);
+      pos = matched.pos; col = matched.col; pad = matched.pad;
       si += 2;
       continue;
     }
