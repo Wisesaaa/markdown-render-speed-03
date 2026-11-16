@@ -81,16 +81,19 @@ function scanEntityRef(s, i, n) {
 // ---------------------------------------------------------------------------
 // Character classes as a bitmask table: SPACE=1, PUNCT=2, DIGIT=4, ALPHA=8.
 // One table lookup replaces the four range-check predicates below.
+// The ranges are declared as [class, lo, hi] triples and applied in
+// one loop, instead of a separate loop per class.
 const CHAR_CLASS = new Uint8Array(128);
-for (let c = 9; c <= 13; c++) CHAR_CLASS[c] |= 1;
-CHAR_CLASS[32] |= 1;
-for (let c = 33; c <= 47; c++) CHAR_CLASS[c] |= 2;
-for (let c = 58; c <= 64; c++) CHAR_CLASS[c] |= 2;
-for (let c = 91; c <= 96; c++) CHAR_CLASS[c] |= 2;
-for (let c = 123; c <= 126; c++) CHAR_CLASS[c] |= 2;
-for (let c = 48; c <= 57; c++) CHAR_CLASS[c] |= 4;
-for (let c = 65; c <= 90; c++) CHAR_CLASS[c] |= 8;
-for (let c = 97; c <= 122; c++) CHAR_CLASS[c] |= 8;
+const CHAR_CLASS_RANGES = [
+  [1, 9, 13], [1, 32, 32],
+  [2, 33, 47], [2, 58, 64], [2, 91, 96], [2, 123, 126],
+  [4, 48, 57],
+  [8, 65, 90], [8, 97, 122],
+];
+for (let r = 0; r < CHAR_CLASS_RANGES.length; r += 1) {
+  let range = CHAR_CLASS_RANGES[r];
+  for (let c = range[1]; c <= range[2]; c += 1) CHAR_CLASS[c] |= range[0];
+}
 function isSpace(c) { return c < 128 && (CHAR_CLASS[c] & 1) !== 0; }
 function isPunct(c) { return c < 128 && (CHAR_CLASS[c] & 2) !== 0; }
 function isDigit(c) { return c < 128 && (CHAR_CLASS[c] & 4) !== 0; }
