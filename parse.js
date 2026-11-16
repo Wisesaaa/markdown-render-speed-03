@@ -1808,24 +1808,27 @@ function emailAddressSpan(text, start, end, to) {
   return { start: spanStart, prefix, end };
 }
 
-// Try a www. autolink at wwwAt. Returns {pos, segStart}: on success the
-// link is emitted and both advance past it; on rejection pos skips past
-// the 'www.' and segStart is unchanged.
+// Build an autolink match record once the URL text and href are
+// known: clean the href (a null cleanUrl means no autolink) and
+// return {urlText, href, start, end}.
+function buildAutolinkMatch(urlText, hrefRaw, start, end) {
+  let linkHref = cleanUrl(hrefRaw);
+  if (linkHref === null) return null;
+  return { urlText, href: linkHref, start, end };
+}
+
 // Match a www. autolink at wwwAt: validate the preceding char, find
 // the URL end, require a dot in the host, and clean the href. Returns
 // {urlText, href, start, end} or null.
 function matchWwwUrl(text, wwwAt, to, from, prev) {
   let before = wwwAt > from ? text[wwwAt - 1] : prev;
-  if (before !== '' && !isUnicodeSpace(before) && before !== '*' && before !== '_' && before !== '~' && before !== '(') {
-    return null;
-  }
+  let okBefore = before === '' || isUnicodeSpace(before) || before === '*' || before === '_' || before === '~' || before === '(';
+  if (!okBefore) return null;
   let urlEnd = matchUrlAt(text, wwwAt, text.length);
   if (urlEnd === -1 || urlEnd > to) return null;
   let urlText = text.slice(wwwAt, urlEnd);
   if (!wwwHostHasDot(urlText)) return null;
-  let linkHref = cleanUrl('http://' + urlText);
-  if (linkHref === null) return null;
-  return { urlText, href: linkHref, start: wwwAt, end: urlEnd };
+  return buildAutolinkMatch(urlText, 'http://' + urlText, wwwAt, urlEnd);
 }
 
 // Match a scheme:// autolink at schemeAt (the '://'): find the scheme
@@ -1837,9 +1840,7 @@ function matchSchemeUrl(text, schemeAt, to, from) {
   let urlEnd = matchUrlAt(text, schemeStart, text.length);
   if (urlEnd === -1 || urlEnd > to) return null;
   let urlText = text.slice(schemeStart, urlEnd);
-  let linkHref = cleanUrl(urlText);
-  if (linkHref === null) return null;
-  return { urlText, href: linkHref, start: schemeStart, end: urlEnd };
+  return buildAutolinkMatch(urlText, urlText, schemeStart, urlEnd);
 }
 
 // Match an email autolink at atAt (the '@'): find the email span and
@@ -1849,9 +1850,8 @@ function matchEmailUrl(text, atAt, to, from) {
   if (!email || email.end > to) return null;
   let span = emailAddressSpan(text, email.start, email.end, to);
   let address = text.slice(span.start, span.end);
-  let linkHref = cleanUrl(span.prefix ? address : 'mailto:' + address);
-  if (linkHref === null) return null;
-  return { urlText: address, href: linkHref, start: span.start, end: span.end };
+  let hrefRaw = span.prefix ? address : 'mailto:' + address;
+  return buildAutolinkMatch(address, hrefRaw, span.start, span.end);
 }
 
 // The per-kind matchers, keyed by candidate kind. Each takes
