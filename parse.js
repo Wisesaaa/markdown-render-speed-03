@@ -3458,6 +3458,70 @@ function fenceDedentLine(text, col, fenceInfo, fenceIndent) {
   return stripLeadingWSChars(text, fenceIndent);
 }
 
+// Handle a line that does not match the containers inside a fenced
+// code block. Returns 'push' (the line belongs to the fence as-is),
+// 'close' (it is a closing fence: advance past it and end the block),
+// or 'end' (the fence ends before this line). A lazy line fails only
+// on a list-item indent: it belongs to the fenced block as-is (marked
+// lexes the fence from the item text, which includes lazy lines). A
+// missing blockquote marker means the line is outside the quote (a
+// code block ends the quote's lazy continuation) -- the fence ends too.
+// A blank line outside the containers ends the block.
+function fencedCodeLazyLine(nextRaw, stripFail, fenceInfo, lineText, blockNode) {
+  if (isBlankStr(nextRaw)) return 'end';
+  if (stripFail.reason !== 'item') return 'end';
+  if (matchFenceClose(nextRaw, 0, fenceInfo.ch, fenceInfo.len)) return 'close';
+  // a lazy line is part of the fence only when the previous
+  // line is not itself a block start (marked's list-item text
+  // building breaks a lazy line after a fence/heading/html/hr
+  // line: the item text ends there, so the fence has no
+  // content after its opening line -- doc-17's empty toml
+  // fence). The previous line is the last content line, or
+  // the opening fence line when the block is still empty.
+  if (fencePrevIsBlockStart(blockNode, lineText)) return 'end';
+  // A lazy line starts a new block when its content AFTER the
+  // containers that did match is a block start. The raw line's
+  // indent is misleading: a list marker at raw indent 4
+  // ('    + ...') is a new item once the outer item's indent
+  // is stripped (doc-12/doc-36).
+  let restAfter = (stripFail.pad > 0 ? ' '.repeat(stripFail.pad) : '') + nextRaw.slice(stripFail.pos);
+  let restCol = stripFail.col - stripFail.pad;
+  if (isFenceBlockStart(restAfter, restCol)) return 'end';
+  return 'push';
+}
+
+// Look ahead from a blank line inside a fenced code block: is there a
+// later non-blank line that still belongs to the block? Returns that
+// line's stripped form, or null. A later line belongs to the block
+// when it matches the containers, when it is a closing fence, or when
+// it is a lazy continuation line.
+function fencedCodeBlankContinues(sourceLines, scanLine, openStack, fenceInfo, lineText, blockNode) {
+  let lookahead = scanLine + 1;
+  while (lookahead < sourceLines.length) {
+    let lookFail = {};
+    let later = stripContainersForLine(sourceLines[lookahead], openStack, lookFail);
+    if (!later) {
+      if (isBlankStr(sourceLines[lookahead])) return null;
+      if (lookFail.reason !== 'item') return null;
+      // lazy line: a closing fence or a content line (whose
+      // previous line is not a block start) continues the
+      // block; a block-starting line ends it
+      if (matchFenceClose(sourceLines[lookahead], 0, fenceInfo.ch, fenceInfo.len)) return { text: sourceLines[lookahead], col: 0 };
+      if (fencePrevIsBlockStart(blockNode, lineText)) return null;
+      // same as the main lazy-line branch: judge the block
+      // start on the content after the containers that did
+      // match, not on the raw line
+      let restAfterK = (lookFail.pad > 0 ? ' '.repeat(lookFail.pad) : '') + sourceLines[lookahead].slice(lookFail.pos);
+      let restColK = lookFail.col - lookFail.pad;
+      if (isFenceBlockStart(restAfterK, restColK)) return null;
+      return { text: sourceLines[lookahead], col: 0 };
+    }
+    if (!isBlankStr(later.text)) return later;
+    lookahead += 1;
+  }
+  return null;
+}
+
 // Consume the lines of a fenced code block starting after its opening
 // line. Returns the scan line just past the block.
 function consumeFencedCode(sourceLines, fromLine, openStack, fenceInfo, lineText, textCol, blockNode) {
@@ -3468,32 +3532,9 @@ function consumeFencedCode(sourceLines, fromLine, openStack, fenceInfo, lineText
     let stripFail = {};
     let stripped = stripContainersForLine(nextRaw, openStack, stripFail);
     if (!stripped) {
-      // the line does not match the containers. A lazy line fails
-      // only on a list-item indent: it belongs to the fenced
-      // block as-is (marked lexes the fence from the item text,
-      // which includes lazy lines). A missing blockquote marker
-      // means the line is outside the quote (a code block ends
-      // the quote's lazy continuation) -- the fence ends too.
-      // A blank line outside the containers ends the block.
-      if (isBlankStr(nextRaw)) break;
-      if (stripFail.reason !== 'item') break;
-      if (matchFenceClose(nextRaw, 0, fenceInfo.ch, fenceInfo.len)) { scanLine += 1; break; }
-      // a lazy line is part of the fence only when the previous
-      // line is not itself a block start (marked's list-item text
-      // building breaks a lazy line after a fence/heading/html/hr
-      // line: the item text ends there, so the fence has no
-      // content after its opening line -- doc-17's empty toml
-      // fence). The previous line is the last content line, or
-      // the opening fence line when the block is still empty.
-      if (fencePrevIsBlockStart(blockNode, lineText)) break;
-      // A lazy line starts a new block when its content AFTER the
-      // containers that did match is a block start. The raw line's
-      // indent is misleading: a list marker at raw indent 4
-      // ('    + ...') is a new item once the outer item's indent
-      // is stripped (doc-12/doc-36).
-      let restAfter = (stripFail.pad > 0 ? ' '.repeat(stripFail.pad) : '') + nextRaw.slice(stripFail.pos);
-      let restCol = stripFail.col - stripFail.pad;
-      if (isFenceBlockStart(restAfter, restCol)) break;
+      let lazy = fencedCodeLazyLine(nextRaw, stripFail, fenceInfo, lineText, blockNode);
+      if (lazy === 'end') break;
+      if (lazy === 'close') { scanLine += 1; break; }
       blockNode.lines.push(nextRaw);
       scanLine += 1;
       continue;
@@ -3504,42 +3545,15 @@ function consumeFencedCode(sourceLines, fromLine, openStack, fenceInfo, lineText
       // after it); otherwise the block ends before it (cm-128: a
       // blank line without a '>' does not belong to a fenced block
       // inside a blockquote). A blank line's spaces (dedented) are
-      // kept as code content. A later line belongs to the block
-      // when it matches the containers, when it is a closing
-      // fence, or when it is a lazy continuation line.
-      let lookahead = scanLine + 1;
-      let laterMatch = null;
-      while (lookahead < sourceLines.length) {
-        let lookFail = {};
-        let later = stripContainersForLine(sourceLines[lookahead], openStack, lookFail);
-        if (!later) {
-          if (isBlankStr(sourceLines[lookahead])) break;
-          if (lookFail.reason !== 'item') break;
-          // lazy line: a closing fence or a content line (whose
-          // previous line is not a block start) continues the
-          // block; a block-starting line ends it
-          if (matchFenceClose(sourceLines[lookahead], 0, fenceInfo.ch, fenceInfo.len)) { laterMatch = { text: sourceLines[lookahead], col: 0 }; break; }
-          if (fencePrevIsBlockStart(blockNode, lineText)) break;
-          // same as the main lazy-line branch: judge the block
-          // start on the content after the containers that did
-          // match, not on the raw line
-          let restAfterK = (lookFail.pad > 0 ? ' '.repeat(lookFail.pad) : '') + sourceLines[lookahead].slice(lookFail.pos);
-          let restColK = lookFail.col - lookFail.pad;
-          if (isFenceBlockStart(restAfterK, restColK)) break;
-          laterMatch = { text: sourceLines[lookahead], col: 0 }; break;
-        }
-        if (!isBlankStr(later.text)) { laterMatch = later; break; }
-        lookahead += 1;
-      }
-      if (laterMatch) {
-        // marked's Dt dedents ONLY backtick fences (its regex is
-        // /^(\s+)(?:```)/ -- a tilde fence never matches); a tilde
-        // fence keeps its content lines as-is
-        blockNode.lines.push(fenceDedentLine(stripped.text, stripped.col, fenceInfo, fenceIndent));
-        scanLine += 1;
-        continue;
-      }
-      break;
+      // kept as code content.
+      let laterMatch = fencedCodeBlankContinues(sourceLines, scanLine, openStack, fenceInfo, lineText, blockNode);
+      if (!laterMatch) break;
+      // marked's Dt dedents ONLY backtick fences (its regex is
+      // /^(\s+)(?:```)/ -- a tilde fence never matches); a tilde
+      // fence keeps its content lines as-is
+      blockNode.lines.push(fenceDedentLine(stripped.text, stripped.col, fenceInfo, fenceIndent));
+      scanLine += 1;
+      continue;
     }
     if (matchFenceClose(stripped.text, stripped.col, fenceInfo.ch, fenceInfo.len)) { scanLine += 1; break; }
     // dedent (up to the fence's indent) -- character-based, backtick
@@ -3594,6 +3608,105 @@ function nextLineIsBlank(sourceLines, scanLine, openStack) {
   if (raw.length === 0) return true;
   let strippedNext = stripContainersForLine(raw, openStack);
   return strippedNext !== null && strippedNext.text === '';
+}
+
+// Match one list container against the current line. A list is
+// transparent: it matches only when the line continues its current
+// item (handled by the item entry) or starts a new item (a list
+// marker here). Otherwise the list is closed and the line belongs to
+// the list's parent. Returns {cursor, column, padding, matchedDepth,
+// nextIdx} on a match (nextIdx is the stack index to continue from),
+// or null when the list closes. `state` is the running match state
+// {cursor, column, padding, matchedDepth}.
+function matchListContainer(openStack, stackIdx, raw, blankLine, prevBlank, state) {
+  let container = openStack[stackIdx];
+  let nextItem = openStack[stackIdx + 1];
+  if (!nextItem || nextItem.type !== 'item') {
+    return { cursor: state.cursor, column: state.column, padding: state.padding, matchedDepth: stackIdx + 1, nextIdx: stackIdx + 1 };
+  }
+  if (blankLine) {
+    return { cursor: state.cursor, column: state.column, padding: state.padding, matchedDepth: stackIdx + 2, nextIdx: stackIdx + 2 };
+  }
+  // a new item marker keeps the list open even after an empty
+  // item + blank line (the empty item is closed, a new one
+  // starts) -- check this before the empty-item close below.
+  // A thematic break is NOT a new item (it closes the list).
+  // Only when the line does NOT continue the current item
+  // (a continuation line such as a setext underline must not
+  // be mistaken for an HR / new item).
+  if (!itemContinues(raw, state.cursor, state.column, state.padding, nextItem.relIndent)) {
+    let restSlice = (state.padding > 0 ? ' '.repeat(state.padding) : '') + raw.slice(state.cursor);
+    let restBaseCol = state.column - state.padding;
+    let keep = listMarkerKeepsList(restSlice, restBaseCol, container);
+    if (keep === 'hr') return null;
+    if (keep === 'marker') {
+      return { cursor: state.cursor, column: state.column, padding: state.padding, matchedDepth: stackIdx + 1, nextIdx: stackIdx + 1 };
+    }
+  }
+  // an empty item followed by a blank line is closed
+  if (nextItem.children.length === 0 && prevBlank) return null;
+  let adv = matchItemIndent(raw, state.cursor, state.column, state.padding, nextItem.relIndent);
+  if (adv) {
+    return { cursor: adv.cursor, column: adv.column, padding: adv.padding, matchedDepth: stackIdx + 2, nextIdx: stackIdx + 2 };
+  }
+  // The item doesn't match: a new item marker keeps the list
+  // open, but ONLY if it matches this list's type/delimiter.
+  // A different marker type closes this list (a new sibling list
+  // starts instead). A thematic break also closes the list
+  // (it is checked before list items in block-start order).
+  let tailText = (state.padding > 0 ? ' '.repeat(state.padding) : '') + raw.slice(state.cursor);
+  let tailCol = state.column - state.padding;
+  let keepTail = listMarkerKeepsList(tailText, tailCol, container);
+  if (keepTail === 'hr') return null;
+  if (keepTail === 'marker') {
+    return { cursor: state.cursor, column: state.column, padding: state.padding, matchedDepth: stackIdx + 1, nextIdx: stackIdx + 1 };
+  }
+  return null;
+}
+
+// Match the open containers (stack entries after the document) against
+// the current line. Returns {cursor, column, padding, matchedDepth}:
+// the position after the matched containers and the depth matched
+// (1 = document only). A container that does not match stops the loop;
+// the containers after it are closed by the caller.
+function matchOpenContainers(openStack, raw, prevBlank) {
+  let cursor = 0;
+  let column = 0;
+  let padding = 0;
+  let matchedDepth = 1; // open-stack depth matched (1 = document only)
+  let blankLine = isBlankStr(raw);
+  let stackIdx = 1;
+  while (stackIdx < openStack.length) {
+    let container = openStack[stackIdx];
+    if (container.type === 'blockquote') {
+      let bq = matchBlockquote(raw, cursor, column, padding, openStack, stackIdx);
+      if (!bq.matched) break;
+      cursor = bq.cursor; column = bq.column; padding = bq.padding;
+      matchedDepth = bq.matchedDepth;
+      if (bq.stop) break;
+      stackIdx += 1;
+      continue;
+    }
+    if (container.type === 'item') {
+      if (blankLine) { matchedDepth = stackIdx + 1; stackIdx += 1; continue; }
+      // an empty item followed by a blank line is closed: later
+      // indented lines do not belong to it
+      if (container.children.length === 0 && prevBlank) break;
+      let adv = matchItemIndent(raw, cursor, column, padding, container.relIndent);
+      if (!adv) break;
+      cursor = adv.cursor; column = adv.column; padding = adv.padding;
+      matchedDepth = stackIdx + 1;
+      stackIdx += 1;
+      continue;
+    }
+    // 'list': transparent container (see matchListContainer).
+    let listMatch = matchListContainer(openStack, stackIdx, raw, blankLine, prevBlank, { cursor, column, padding, matchedDepth });
+    if (!listMatch) break;
+    cursor = listMatch.cursor; column = listMatch.column; padding = listMatch.padding;
+    matchedDepth = listMatch.matchedDepth;
+    stackIdx = listMatch.nextIdx;
+  }
+  return { cursor, column, padding, matchedDepth };
 }
 
 function parseBlocks(sourceLines, linkDefs, endsWithNewline) {
@@ -3655,76 +3768,11 @@ function parseBlocks(sourceLines, linkDefs, endsWithNewline) {
     const prevWasLazy = prevLazy;
     prevLazy = false;
     // ---------- Phase 1: match open containers ----------
-    let cursor = 0, column = 0, padding = 0;
-    let matchedDepth = 1; // open-stack depth matched (1 = document only)
-    const blankLine = isBlankStr(raw);
-    for (let stackIdx = 1; stackIdx < openStack.length; stackIdx++) {
-      const container = openStack[stackIdx];
-      if (container.type === 'blockquote') {
-        let bq = matchBlockquote(raw, cursor, column, padding, openStack, stackIdx);
-        if (!bq.matched) break;
-        cursor = bq.cursor; column = bq.column; padding = bq.padding;
-        matchedDepth = bq.matchedDepth;
-        if (bq.stop) break;
-        continue;
-      }
-      if (container.type === 'item') {
-        if (blankLine) { matchedDepth = stackIdx + 1; continue; }
-        // an empty item followed by a blank line is closed: later
-        // indented lines do not belong to it
-        if (container.children.length === 0 && prevBlank) break;
-        let adv = matchItemIndent(raw, cursor, column, padding, container.relIndent);
-        if (!adv) break;
-        cursor = adv.cursor; column = adv.column; padding = adv.padding;
-        matchedDepth = stackIdx + 1;
-        continue;
-      }
-      // 'list': transparent container. It matches only when the line
-      // continues its current item (handled by the item entry below) or
-      // starts a new item (a list marker here). Otherwise the list is
-      // closed and the line belongs to the list's parent.
-      {
-        const nextItem = openStack[stackIdx + 1];
-        if (nextItem && nextItem.type === 'item') {
-          if (blankLine) { matchedDepth = stackIdx + 2; stackIdx++; continue; }
-          // a new item marker keeps the list open even after an empty
-          // item + blank line (the empty item is closed, a new one
-          // starts) -- check this before the empty-item close below.
-          // A thematic break is NOT a new item (it closes the list).
-          // Only when the line does NOT continue the current item
-          // (a continuation line such as a setext underline must not
-          // be mistaken for an HR / new item).
-          if (!itemContinues(raw, cursor, column, padding, nextItem.relIndent)) {
-            const restSlice = (padding > 0 ? ' '.repeat(padding) : '') + raw.slice(cursor);
-            const restBaseCol = column - padding;
-            let keep = listMarkerKeepsList(restSlice, restBaseCol, container);
-            if (keep === 'hr') break;
-            if (keep === 'marker') { matchedDepth = stackIdx + 1; continue; }
-          }
-          // an empty item followed by a blank line is closed
-          if (nextItem.children.length === 0 && prevBlank) break;
-          let adv = matchItemIndent(raw, cursor, column, padding, nextItem.relIndent);
-          if (adv) {
-            cursor = adv.cursor; column = adv.column; padding = adv.padding;
-            matchedDepth = stackIdx + 2;
-            stackIdx++; // item already matched; skip it next iteration
-            continue;
-          }
-          // The item doesn't match: a new item marker keeps the list
-          // open, but ONLY if it matches this list's type/delimiter.
-          // A different marker type closes this list (a new sibling list
-          // starts instead). A thematic break also closes the list
-          // (it is checked before list items in block-start order).
-          const tailText = (padding > 0 ? ' '.repeat(padding) : '') + raw.slice(cursor);
-          const tailCol = column - padding;
-          let keepTail = listMarkerKeepsList(tailText, tailCol, container);
-          if (keepTail === 'hr') break;
-          if (keepTail === 'marker') { matchedDepth = stackIdx + 1; continue; }
-          break;
-        }
-        matchedDepth = stackIdx + 1;
-      }
-    }
+    let matched = matchOpenContainers(openStack, raw, prevBlank);
+    let cursor = matched.cursor;
+    let column = matched.column;
+    let padding = matched.padding;
+    let matchedDepth = matched.matchedDepth;
 
     // content after the matched containers
     let lineText = (padding > 0 ? ' '.repeat(padding) : '') + raw.slice(cursor);
