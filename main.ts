@@ -10,20 +10,25 @@ import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from './parse.js';
 
-function run() {
+// Resolve the input/output directories, honouring the MAKEFUN_*
+// environment overrides and falling back to the container paths.
+function dirs() {
   let inputDir = process.env.MAKEFUN_INPUT_DIR;
   if (inputDir === undefined) inputDir = '/input';
   let outputDir = process.env.MAKEFUN_OUTPUT_DIR;
   if (outputDir === undefined) outputDir = '/output';
+  return { inputDir, outputDir };
+}
+
+function main() {
+  let { inputDir, outputDir } = dirs();
   const cases = JSON.parse(readFileSync(join(inputDir, 'cases.json'), 'utf8'));
-  let html = [];
-  let idx = 0;
-  while (idx < cases.length) {
-    html[html.length] = parse(cases[idx].markdown);
-    idx += 1;
+  let html = new Array(cases.length);
+  for (let idx = 0; idx < cases.length; idx += 1) {
+    html[idx] = parse(cases[idx].markdown);
   }
   mkdirSync(outputDir, { recursive: true });
   writeFileSync(join(outputDir, 'html.json'), JSON.stringify(html));
 }
 
-run();
+main();
